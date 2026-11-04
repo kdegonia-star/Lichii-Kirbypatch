@@ -1364,7 +1364,8 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
                                              key.unique_hash);
 
 } catch (const Shader::Exception& exception) {
-    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    LOG_ERROR(Render_Vulkan, "Compute shader {:#016x} at offset {:#x}: {}",
+              key.unique_hash, env.StartAddress(), exception.what());
     return nullptr;
 }
 
