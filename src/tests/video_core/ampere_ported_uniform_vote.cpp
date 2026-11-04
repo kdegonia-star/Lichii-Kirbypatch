@@ -133,3 +133,17 @@ TEST_CASE("Ampere uniform votes reject unmapped registers and unsupported fields
         REQUIRE_FALSE(lowered);
     }
 }
+
+TEST_CASE("Ampere Kirby uniform moves use the mapped register bank",
+          "[video_core][ampere][uniform_vote]") {
+    for (u32 source : {0U, 15U, 16U, 21U, 22U, 27U, 63U}) {
+        const Instruction move{{0x006a7c02, source, 0x08000f00, 0x000fe200}};
+        const auto lowered = LowerToMaxwell(std::array{move, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        REQUIRE(lowered.instructions.size() == 2);
+        REQUIRE(((lowered.instructions[0] >> 20) & 255) == LowUniform(source));
+    }
+    const Instruction invalid{{0x006a7c02, 64, 0x08000f00, 0x000fe200}};
+    REQUIRE_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
+}
