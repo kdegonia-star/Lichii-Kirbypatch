@@ -2645,6 +2645,32 @@ private:
             // fence as a frame to acquire.
             if (ctx.GetCommand() == 207) {
                 CompleteHandedFences();
+                static const bool stop_eos = [] {
+                    const char* value = std::getenv("EDEN_NX2_VDEC_STOP_EOS");
+                    return value && std::string_view{value} == "1";
+                }();
+                if (stop_eos) {
+                    // Diagnostic experiment: expose EOS after Stop without advancing an
+                    // unissued fence or writing to an image the client may already own.
+                    m_stream_ended = true;
+                    m_ready->room.store(false, std::memory_order_relaxed);
+                    if (!m_outputs.empty()) {
+                        m_outputs.back().end = true;
+                    } else if (m_frames_out != 0) {
+                        // Repeat only the last output's metadata as a terminal notification.
+                        // This is opt-in because Stop's output-ownership contract is unknown.
+                        auto terminal = m_last_output;
+                        terminal.end = true;
+                        m_outputs.push_back(terminal);
+                    }
+                    if (m_event) {
+                        m_event->Signal(system.Kernel());
+                    }
+                    LOG_INFO(Service, "vdec session {} Stop EOS experiment: ended=true, "
+                                      "outputs={}, event={}",
+                             fmt::ptr(this), m_outputs.size(), m_event != nullptr);
+                    TraceState("stop EOS notification");
+                }
             }
         }
         m_cv.notify_one();
