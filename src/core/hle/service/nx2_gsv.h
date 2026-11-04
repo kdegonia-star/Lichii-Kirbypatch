@@ -2421,11 +2421,16 @@ private:
         if (!TraceEnabled()) {
             return;
         }
+        const u32 current = m_syncpoint == NoSyncpoint
+                                ? 0
+                                : static_cast<u32>(system.Host1x().GetSyncpointManager()
+                                                       .GetGuestSyncpointValue(m_syncpoint));
         LOG_INFO(Service,
                  "vdec session {} {}: inputs={} decoded={} free={} outputs={} "
-                 "syncpoint={} base={} handed={} ended={} flush={}",
+                 "syncpoint={} current={} target={} base={} handed={} ended={} flush={}",
                  fmt::ptr(this), event, m_inputs.size(), m_decoded.size(), m_free.size(),
-                 m_outputs.size(), m_syncpoint, m_sync_base, m_handed, m_stream_ended, m_flush);
+                 m_outputs.size(), m_syncpoint, current, m_sync_base + m_handed, m_sync_base,
+                 m_handed, m_stream_ended, m_flush);
     }
 
     void Log(HLERequestContext& ctx, std::string_view what) {
@@ -2614,6 +2619,9 @@ private:
         {
             std::scoped_lock lk{m_mutex};
             m_inputs.push_back(std::move(input));
+            if (m_inputs.size() == MaxQueuedInputs + 1) {
+                TraceState("input queue exceeded readiness threshold");
+            }
             m_stream_ended = false;
             m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
         }
@@ -2665,6 +2673,7 @@ private:
             syncpoints.IncrementGuest(m_syncpoint);
             ++current;
         }
+        TraceState("completed handed fences");
     }
 
     void GetOutputInfo(HLERequestContext& ctx) {

@@ -356,6 +356,17 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
                   "Invalid texture descriptor: raw={:#x} index={:#x} limit={:#x} "
                   "table={:#x} header_index={} native={}",
                   raw, index, tic_limit, tic_addr, via_header_index, gpu_memory->UsesNativeTiling());
+        LOG_ERROR(HW_GPU, "Invalid texture source: program={:#x} start={:#x} cbuf_reads={}",
+                  program_base, start_address, cbuf_values.size());
+        // Exact matches identify direct handles; the bounded sample also exposes split handles.
+        size_t sampled{};
+        for (const auto& [key, value] : cbuf_values) {
+            if (value == raw || sampled < 32) {
+                LOG_ERROR(HW_GPU, "Texture source cbuf[{}][{:#x}]={:#x} exact_match={}",
+                          static_cast<u32>(key >> 32), static_cast<u32>(key), value, value == raw);
+                ++sampled;
+            }
+        }
     }
     ASSERT(index <= tic_limit);
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
