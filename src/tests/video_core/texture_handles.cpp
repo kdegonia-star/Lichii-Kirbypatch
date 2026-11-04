@@ -285,3 +285,71 @@ TEST_CASE("Native shared-memory texture table uses a fixed sampler",
     CHECK_FALSE(sample.Arg(0).IsImmediate());
     CHECK(offset.Inst()->GetOpcode() == Opcode::LoadSharedU32);
 }
+
+TEST_CASE("Texture arrays reserve the final static and buffer resources",
+          "[video_core][texture_handles]") {
+    for (const u32 arrays : {1U, 2U}) {
+        HandleProgram shader;
+        const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+        auto& sample{shader.Sample(shader.Emit(Opcode::GetCbufU32, {Value{0U}, offset}))};
+        shader.Run();
+        auto& info = shader.program.info;
+        const auto descriptor = info.texture_descriptors.front();
+        for (u32 i = 1; i < arrays; ++i) {
+            info.texture_descriptors.push_back(descriptor);
+        }
+        for (u32 i = 0; i < 3; ++i) {
+            auto fixed = descriptor;
+            fixed.count = 1;
+            info.texture_descriptors.push_back(fixed);
+        }
+        for (u32 i = 0; i < 5; ++i) {
+            info.constant_buffer_descriptors.push_back({.index = i, .count = 1});
+        }
+        for (u32 i = 0; i < 2; ++i) {
+            info.storage_buffers_descriptors.push_back({.count = 1});
+        }
+        Shader::HostTranslateInfo host;
+        host.ApplyDescriptorLimitPolicy();
+        host.max_per_stage_resources = 16;
+        host.max_per_stage_descriptor_sampled_images = 16;
+        host.max_descriptor_set_sampled_images = 16;
+        Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
+        for (u32 i = 0; i < arrays; ++i) {
+            CHECK(info.texture_descriptors[i].count == 6 / arrays);
+        }
+        CHECK(Shader::NumDescriptors(info.texture_descriptors) == 9);
+        CHECK(sample.Arg(0).InstRecursive()->Arg(1).U32() == 6 / arrays - 1);
+        if (arrays == 2) {
+            info.texture_descriptors[0].count = 2;
+            info.texture_descriptors[1].count = 12;
+            host.max_per_stage_resources = 24;
+            host.max_per_stage_descriptor_sampled_images = 24;
+            host.max_descriptor_set_sampled_images = 24;
+            Shader::Optimization::LimitSampledTextureArrays(shader.program, host);
+            CHECK(info.texture_descriptors[0].count == 2);
+            CHECK(info.texture_descriptors[1].count == 12);
+        }
+        host.max_per_stage_resources = 10;
+        REQUIRE_THROWS(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
+    }
+}
+
+TEST_CASE("Native shifted texture table preserves its sixteen-byte stride",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.native_program = true;
+    const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{4U}})};
+    const Value texture{shader.Emit(Opcode::GetCbufU32, {Value{4U}, offset})};
+    const Value sampler{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::BitwiseOr32, {texture, sampler}))};
+    shader.Run();
+    CHECK(shader.Descriptor(sample).secondary_is_static);
+    CHECK(shader.Descriptor(sample).size_shift == 4);
+    REQUIRE_FALSE(sample.Arg(0).IsEmpty());
+    const auto* selection = sample.Arg(0).InstRecursive();
+    REQUIRE(selection->GetOpcode() == Opcode::UMin32);
+    const auto* index = selection->Arg(0).InstRecursive();
+    REQUIRE(index->GetOpcode() == Opcode::ShiftRightLogical32);
+    CHECK(index->Arg(1).U32() == 4);
+}
