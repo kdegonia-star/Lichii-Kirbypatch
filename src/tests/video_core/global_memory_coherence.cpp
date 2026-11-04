@@ -245,3 +245,38 @@ TEST_CASE("Joining vertex storage preserves coherent memory requirement", "[vide
         }
     }
 }
+
+TEST_CASE("Global integer atomic add emits an atomic operation through address lookup",
+          "[video_core][coherence]") {
+    for (const bool native_bounds : {false, true}) {
+        Program fixture;
+        fixture.profile.support_int64 = true;
+        auto& info = fixture.program.info;
+        info.native_global_bounds = native_bounds;
+        info.storage_buffers_descriptors = {{0, 0, 1, true}, {0, 16, 1, true}};
+        info.constant_buffer_descriptors = {{0, 1}};
+        info.nvn_buffer_used.set(0);
+        info.nvn_buffer_used.set(1);
+        IR::IREmitter ir{fixture.block};
+        fixture.block.AppendNewInst(IR::Opcode::GlobalAtomicIAdd32,
+                                    {ir.Imm64(0x1000), ir.Imm32(7)});
+        TestEnvironment env{native_bounds};
+        Optimization::CollectShaderInfoPass(env, fixture.program);
+        const auto code = Backend::SPIRV::EmitSPIRV(fixture.profile, fixture.program);
+        const auto atomics = Instructions(code, 234); // OpAtomicIAdd
+        REQUIRE(atomics.size() == 2);
+        std::map<u32, u32> constants;
+        for (const auto& op : Instructions(code, 43)) {
+            if (op.size() == 3) constants[op[1]] = op[2];
+        }
+        for (const auto& op : atomics) {
+            REQUIRE(op.size() == 6);
+            CHECK(constants.at(op[3]) == 1); // Device scope
+            CHECK(constants.at(op[4]) == 0); // Relaxed, as for storage atomics
+        }
+        const auto calls = Instructions(code, 57); // OpFunctionCall
+        REQUIRE(calls.size() == 1);
+        REQUIRE(calls[0].size() == 5);
+        CHECK(constants.at(calls[0][4]) == 7);
+    }
+}
