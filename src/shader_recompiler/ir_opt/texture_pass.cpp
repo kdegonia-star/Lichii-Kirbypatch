@@ -16,6 +16,7 @@
 #include <limits>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
@@ -934,7 +935,65 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     };
 }
 
-TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
+// Bound the dump and walk iteratively: handle expressions can contain cyclic Phi nodes.
+void LogFailedHandle(const IR::Inst& texture, const IR::Program& program) {
+    constexpr size_t MaxNodes = 256;
+    std::unordered_map<const IR::Inst*, size_t> ids;
+    std::vector<const IR::Inst*> pending;
+    const auto enqueue = [&](const IR::Inst* node) {
+        if (node && !ids.contains(node) && pending.size() < MaxNodes) {
+            ids.emplace(node, pending.size());
+            pending.push_back(node);
+        }
+    };
+    enqueue(&texture);
+    size_t shared_writes{};
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& node : block->Instructions()) {
+            switch (node.GetOpcode()) {
+            case IR::Opcode::WriteSharedU8:
+            case IR::Opcode::WriteSharedU16:
+            case IR::Opcode::WriteSharedU32:
+            case IR::Opcode::WriteSharedU64:
+            case IR::Opcode::WriteSharedU128:
+                if (shared_writes++ < 32) enqueue(&node);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    LOG_WARNING(Shader, "Native handle graph begin: texture={} shared_writes={} limit={}",
+                texture.GetOpcode(), shared_writes, MaxNodes);
+    for (size_t i = 0; i < pending.size(); ++i) {
+        const IR::Inst* node = pending[i];
+        LOG_WARNING(Shader, "Handle node {} opcode={} args={}", i, node->GetOpcode(),
+                    node->NumArgs());
+        for (size_t arg = 0; arg < node->NumArgs(); ++arg) {
+            const IR::Value value{node->Arg(arg)};
+            if (value.IsImmediate()) {
+                u64 bits{};
+                if (value.Type() == IR::Type::U32) bits = value.U32();
+                else if (value.Type() == IR::Type::U64) bits = value.U64();
+                else if (value.Type() == IR::Type::U1) bits = value.U1();
+                LOG_WARNING(Shader, "Handle node {} arg {} immediate type={} integer_bits={:#x}",
+                            i, arg, static_cast<u32>(value.Type()), bits);
+            } else {
+                const IR::Inst* source = value.InstRecursive();
+                enqueue(source);
+                const auto found = ids.find(source);
+                if (found != ids.end()) {
+                    LOG_WARNING(Shader, "Handle node {} arg {} -> node {}", i, arg, found->second);
+                } else {
+                    LOG_WARNING(Shader, "Handle node {} arg {} truncated", i, arg);
+                }
+            }
+        }
+    }
+    LOG_WARNING(Shader, "Native handle graph end: nodes={}", pending.size());
+}
+
+TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info, const IR::Program& program) {
     ConstBufferAddr addr;
     if (IsBindless(inst)) {
         const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
@@ -950,6 +1009,7 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
                 if (env.IsNativeProgram()) {
+                    LogFailedHandle(inst, program);
                     throw NotImplementedException(
                         "Failed to preserve native texture handle (stopped at {}, budget {})",
                         g_handle_failure, budget);
@@ -1189,7 +1249,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (!IsTextureInstruction(inst)) {
                 continue;
             }
-            to_replace.push_back(MakeInst(env, block, inst, host_info));
+            to_replace.push_back(MakeInst(env, block, inst, host_info, program));
         }
     }
     // Sort instructions to visit textures by constant buffer index, then by offset
