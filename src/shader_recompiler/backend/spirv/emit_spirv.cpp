@@ -108,8 +108,9 @@ void EmitInst(EmitContext& ctx, IR::Inst* inst) try {
 #undef OPCODE
     }
     throw LogicError("Invalid opcode {}", inst->GetOpcode());
-} catch (Exception& exception) {
-    exception.Prepend(fmt::format("SPIR-V opcode {}: ", IR::NameOf(inst->GetOpcode())));
+} catch (Shader::Exception& exception) {
+    exception.Prepend(fmt::format("SPIR-V emission failed at IR opcode {}: ",
+                                  IR::NameOf(inst->GetOpcode())));
     throw;
 }
 

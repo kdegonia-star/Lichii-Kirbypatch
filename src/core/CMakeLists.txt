@@ -800,6 +800,7 @@ add_library(core STATIC
     hle/service/nfp/nfp_types.h
     hle/service/ngc/ngc.cpp
     hle/service/ngc/ngc.h
+    hle/service/ngc/guest_hid.h
     hle/service/nifm/nifm.cpp
     hle/service/nifm/nifm.h
     hle/service/nim/nim.cpp
@@ -1049,7 +1050,10 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
+    hle/service/nx2_present_pacer.h
+    hle/service/nx2_video_ready.h
     hle/service/services.cpp
     hle/service/services.h
     hle/service/set/factory_settings_server.cpp

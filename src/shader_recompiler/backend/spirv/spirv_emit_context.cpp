@@ -15,7 +15,9 @@
 
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
 namespace Shader::Backend::SPIRV {
@@ -900,10 +902,13 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
 }
 
 void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
-    if (profile.support_int8 && profile.support_int16) {
-        return;
-    }
-    if (!info.uses_int8 && !info.uses_int16) {
+    // Must match the conditions in EmitWriteStorage{U,S}{8,16}: the CAS loop is also used when
+    // storage buffer 8/16-bit access or descriptor aliasing is unavailable (e.g. Qualcomm).
+    const bool direct_int8{profile.support_int8 && profile.support_storage_buffer_8bit &&
+                           profile.support_descriptor_aliasing};
+    const bool direct_int16{profile.support_int16 && profile.support_storage_buffer_16bit &&
+                            profile.support_descriptor_aliasing};
+    if ((direct_int8 || !info.uses_int8) && (direct_int16 || !info.uses_int16)) {
         return;
     }
 
@@ -950,7 +955,7 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
 }
 
 void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
-    const auto& info = program.info;
+    const Info& info{program.info};
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }
@@ -963,10 +968,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
         const auto base_address{[&](size_t index) {
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_addr_pointer{OpAccessChain(uniform_types.U32x2,
-                                                     cbufs[ssbo.cbuf_index].U32x2, zero,
-                                                     Const(ssbo.cbuf_offset / 8))};
-            const Id unaligned_addr{OpBitcast(U64, OpLoad(U32[2], ssbo_addr_pointer))};
+            const Id words{EmitGetCbufU32x2(*this, IR::Value{ssbo.cbuf_index},
+                                           IR::Value{ssbo.cbuf_offset})};
+            const Id unaligned_addr{OpBitcast(U64, words)};
             return OpBitwiseAnd(U64, unaligned_addr, Constant(U64, ssbo_align_mask));
         }};
         const auto access{[&](size_t index, Id ssbo_addr, Id cond) {
@@ -1003,15 +1007,14 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             return;
         }
         for (size_t index = 0; index < num_buffers; ++index) {
-            if (!info.nvn_buffer_used[index]) {
+            if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
                 continue;
             }
             const auto& ssbo{info.storage_buffers_descriptors[index]};
-            const Id ssbo_size_cbuf_offset{Const(ssbo.cbuf_offset / 4 + 2)};
-            const Id ssbo_size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32,
-                                                     zero, ssbo_size_cbuf_offset)};
             const Id ssbo_addr{base_address(index)};
-            const Id ssbo_size{OpUConvert(U64, OpLoad(U32[1], ssbo_size_pointer))};
+            const Id size{EmitGetCbufU32(*this, IR::Value{ssbo.cbuf_index},
+                                       IR::Value{ssbo.cbuf_offset + 8})};
+            const Id ssbo_size{OpUConvert(U64, size)};
             const Id ssbo_end{OpIAdd(U64, ssbo_addr, ssbo_size)};
             const Id cond{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, ssbo_addr),
                                        OpULessThan(U1, addr, ssbo_end))};
@@ -1022,6 +1025,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id function_type{TypeFunction(type, U64)};
         const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
+        if (!profile.support_descriptor_aliasing && shift > 2) {
+            AddLabel();
+            std::array<Id, 4> words;
+            const u32 count = 1U << (shift - 2);
+            for (u32 i = 0; i < count; ++i) {
+                const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
+                words[i] = OpFunctionCall(U32[1], load_global_func_u32, word_address);
+            }
+            OpReturnValue(OpCompositeConstruct(type, std::span{words}.first(count)));
+            OpFunctionEnd();
+            return func_id;
+        }
         define_body(ssbo_member, addr, element_pointer, shift,
                     [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
         OpReturnValue(ConstantNull(type));
@@ -1033,6 +1048,18 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         const Id data{OpFunctionParameter(type)};
+        if (!profile.support_descriptor_aliasing && shift > 2) {
+            AddLabel();
+            const u32 count = 1U << (shift - 2);
+            for (u32 i = 0; i < count; ++i) {
+                const Id word_address{OpIAdd(U64, addr, Constant(U64, i * sizeof(u32)))};
+                const Id word{OpCompositeExtract(U32[1], data, i)};
+                OpFunctionCall(void_id, write_global_func_u32, word_address, word);
+            }
+            OpReturn();
+            OpFunctionEnd();
+            return func_id;
+        }
         define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
             OpStore(ssbo_pointer, data);
             OpReturn();
@@ -1056,25 +1083,29 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     std::tie(load_global_func_u32x4, write_global_func_u32x4) =
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
 
-    const bool uses_atomic_iadd = std::ranges::any_of(program.blocks, [](const IR::Block* block) {
-        return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
-            return inst.GetOpcode() == IR::Opcode::GlobalAtomicIAdd32;
-        });
-    });
-    if (!uses_atomic_iadd) {
+    if (!std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+            return std::ranges::any_of(block->Instructions(), [](const IR::Inst& inst) {
+                return inst.GetOpcode() == IR::Opcode::GlobalAtomicIAdd32;
+            });
+        })) {
+        return;
+    }
+    if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
+            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
+        })) {
         return;
     }
     const Id function_type{TypeFunction(U32[1], U64, U32[1])};
-    atomic_iadd_global_func_u32 =
+    atomic_add_global_func_u32 =
         OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
     const Id address{OpFunctionParameter(U64)};
     const Id value{OpFunctionParameter(U32[1])};
+    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
     define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
                 [&](Id pointer) {
-                    const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
-                    OpReturnValue(OpAtomicIAdd(U32[1], pointer, scope, zero, value));
+                    OpReturnValue(OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value));
                 });
-    OpReturnValue(zero);
+    OpReturnValue(u32_zero_value);
     OpFunctionEnd();
 }
 
@@ -1495,7 +1526,7 @@ void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_inde
 
 void EmitContext::DefineInputs(const IR::Program& program) {
     const Info& info{program.info};
-    const VaryingState loads{info.loads.mask | info.passthrough.mask};
+    const VaryingState& loads{info.loads};
 
     if (info.uses_workgroup_id) {
         workgroup_id = DefineInput(*this, U32[3], false, spv::BuiltIn::WorkgroupId);
@@ -1565,7 +1596,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) ||
+        info.passthrough.AnyComponent(IR::Attribute::PositionX)) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -1638,7 +1670,7 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         if (!runtime_info.previous_stage_stores.Generic(index)) {
             continue;
         }
-        if (!loads.Generic(index)) {
+        if (!loads.Generic(index) && !info.passthrough.Generic(index)) {
             continue;
         }
         if (input_type == AttributeType::Disabled) {

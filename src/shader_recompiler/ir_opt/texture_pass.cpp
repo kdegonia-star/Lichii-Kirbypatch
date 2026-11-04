@@ -838,8 +838,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         if (lhs->has_secondary || rhs->has_secondary) {
             return std::nullopt;
         }
-        if (lhs->count > 1 || rhs->count > 1) {
-            if (!env.IsNativeProgram() || (lhs->count > 1 && rhs->count > 1)) {
+        if (env.IsNativeProgram() && (lhs->count > 1 || rhs->count > 1)) {
+            if (lhs->count > 1 && rhs->count > 1) {
                 return std::nullopt;
             }
             if (rhs->count > 1) std::swap(lhs, rhs);
@@ -851,7 +851,12 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             lhs->secondary_is_static = true;
             return lhs;
         }
-        if (lhs->shift_left > 0 || lhs->index > rhs->index || lhs->offset > rhs->offset) {
+        if (lhs->count > 1 && rhs->count > 1) {
+            return std::nullopt;
+        }
+        if (rhs->count > 1 ||
+            (lhs->count == 1 &&
+             (lhs->shift_left > 0 || lhs->index > rhs->index || lhs->offset > rhs->offset))) {
             std::swap(lhs, rhs);
         }
         return ConstBufferAddr{
@@ -861,8 +866,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             .secondary_index = rhs->index,
             .secondary_offset = rhs->offset,
             .secondary_shift_left = rhs->shift_left,
-            .dynamic_offset = {},
-            .count = 1,
+            .dynamic_offset = lhs->dynamic_offset,
+            .count = lhs->count,
             .has_secondary = true,
         };
     }
@@ -947,7 +952,8 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
     } else if (offset_inst->GetOpcode() == IR::Opcode::IAdd32 && offset_inst->Arg(1).IsImmediate()) {
         base_offset = offset_inst->Arg(1).U32();
         dynamic_offset = IR::U32{offset_inst->Arg(0)};
-    } else if (!env.IsNativeProgram()) {
+    } else if (!env.IsNativeProgram() &&
+               offset_inst->GetOpcode() != IR::Opcode::ShiftLeftLogical32) {
         return std::nullopt;
     }
     auto const size_shift = DynamicDescriptorSizeShift(dynamic_offset);
@@ -1207,6 +1213,8 @@ private:
     ImageDescriptors& image_descriptors;
 };
 
+// Expects the sample's descriptor to be assigned: the size query reads the same texture (and
+// the same element of a descriptor array).
 void PatchImageSampleImplicitLod(IR::Block& block, IR::Inst& inst) {
     IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     const auto info{inst.Flags<IR::TextureInstInfo>()};
@@ -1352,6 +1360,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (flags.type != TextureType::Color2D) {
                 break;
             }
+            // Normalized once the descriptor is known (below).
             is_rect_sample = ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
             break;
         case IR::Opcode::ImageFetch:

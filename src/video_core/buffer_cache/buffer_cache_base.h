@@ -243,7 +243,9 @@ public:
 
     void UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size);
 
-    void WriteMemory(DAddr device_addr, u64 size);
+    /// `keep_page_gpu_data`: download GPU-written bytes sharing the written pages first (false
+    /// when the memory is going away).
+    void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
@@ -340,11 +342,13 @@ public:
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
-    enum class Nx2ListRead { Unknown, Copied, Synced };
+    enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
-    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out);
+    /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
+    /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
+    Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync);
     /// Front thread, the split drained: the command list page was flushed to guest memory.
     void Nx2NoteListSynced(DAddr page);
     /// CPU and inline writes: they reach guest memory, so a synced page stays synced, but its copy
@@ -613,9 +617,12 @@ private:
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
 
     // Async Buffers
-    Common::OverlapRangeSet<DAddr> async_downloads;
     std::deque<std::optional<Async_Buffer>> async_buffers;
     std::deque<boost::container::small_vector<BufferCopy, 4>> pending_downloads;
+    /// For each entry of pending_downloads: the ranges it still writes to guest memory when its
+    /// fence pops. A write to a range after a download was taken removes it from that download
+    /// (and every other pending one): its bytes are older than the write.
+    std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
     std::optional<Async_Buffer> current_buffer;
 
     std::deque<Async_Buffer> async_buffers_death_ring;
@@ -659,8 +666,10 @@ private:
         u32 copy_begin{};  ///< Bytes of the page the copy holds (a buffer can end inside it)
         u32 copy_end{};
         /// Written outside a compute dispatch or a DMA copy (a draw's storage writes) at least
-        /// once: the front can't tell from what it sent whether such a write is still queued, so
-        /// the page's lists always drain the split instead of reading a copy.
+        /// once: the front can't tell from what it sent which draws write the page, so it reads
+        /// no copy. A draw's writes reach a pushbuffer fetch only after a host-level wait, so
+        /// the page's lists read guest memory once the back ran the work before the last such
+        /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
         std::optional<Nx2Staging> copy;
     };

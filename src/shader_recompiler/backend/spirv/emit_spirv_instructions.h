@@ -230,6 +230,7 @@ Id EmitFPNeg64(EmitContext& ctx, Id value);
 Id EmitFPSin(EmitContext& ctx, Id value);
 Id EmitFPCos(EmitContext& ctx, Id value);
 Id EmitFPExp2(EmitContext& ctx, Id value);
+Id EmitFPTanh(EmitContext& ctx, Id value);
 Id EmitFPLog2(EmitContext& ctx, Id value);
 Id EmitFPRecip32(EmitContext& ctx, Id value);
 Id EmitFPRecip64(EmitContext& ctx, Id value);
@@ -422,7 +423,7 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
                              Id value);
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value);
-Id EmitGlobalAtomicIAdd32(EmitContext& ctx, Id address, Id value);
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value);
 Id EmitGlobalAtomicSMin32(EmitContext& ctx);
 Id EmitGlobalAtomicUMin32(EmitContext& ctx);
 Id EmitGlobalAtomicSMax32(EmitContext& ctx);

@@ -417,11 +417,14 @@ Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const I
     return ctx.OpPackHalf2x16(ctx.U32[1], result);
 }
 
-Id EmitGlobalAtomicIAdd32(EmitContext& ctx, Id address, Id value) {
+Id EmitGlobalAtomicIAdd32(EmitContext& ctx, const IR::Value& address, Id value) {
     if (!ctx.profile.support_int64) {
-        throw NotImplementedException("Global atomic address without Int64 support");
+        throw NotImplementedException("Global atomic addressing requires 64-bit integers");
     }
-    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_iadd_global_func_u32, address, value);
+    if (!Sirit::ValidId(ctx.atomic_add_global_func_u32)) {
+        throw NotImplementedException("Global atomic add with no routable storage buffer");
+    }
+    return ctx.OpFunctionCall(ctx.U32[1], ctx.atomic_add_global_func_u32, ctx.Def(address), value);
 }
 
 Id EmitGlobalAtomicSMin32(EmitContext&) {

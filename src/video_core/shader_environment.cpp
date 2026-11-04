@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -372,6 +373,22 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry;
     gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
+        std::getenv("EDEN_NX2_RENDER_TRACE")) {
+        static std::atomic<u32> traces{};
+        if (traces.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_WARNING(HW_GPU,
+                        "Zero-format shader TIC: program={:#x} stage={} handle={:#x} "
+                        "index={} limit={} descriptor={:#x} mapped={} image={:#x} "
+                        "size={}x{}x{} header={} type={} raw={:016x}/{:016x}/{:016x}/{:016x}",
+                        program_base, static_cast<u32>(stage), raw, index, tic_limit,
+                        descriptor_addr, gpu_memory->IsFullyMappedRange(descriptor_addr, sizeof(entry)),
+                        entry.Address(), entry.Width(), entry.Height(), entry.Depth(),
+                        static_cast<u32>(entry.header_version.Value()),
+                        static_cast<u32>(entry.texture_type.Value()),
+                        entry.raw[0], entry.raw[1], entry.raw[2], entry.raw[3]);
+        }
+    }
     return entry;
 }
 
@@ -500,7 +517,17 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                                                            return ReadTrapGuardConstant(bank, offset);
                                                        })))
         throw Shader::Ampere::TrapGuardError{};
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, geometry_stage, true, verified_traps);
+    const auto tessellation_stage = stage == Shader::Stage::TessellationControl
+                                       ? Shader::Ampere::TessellationStage::Control
+                                   : stage == Shader::Stage::TessellationEval
+                                       ? Shader::Ampere::TessellationStage::Evaluation
+                                       : Shader::Ampere::TessellationStage::None;
+    auto lowered = Shader::Ampere::LowerToMaxwell(
+        native, {.geometry = geometry_stage,
+                 .tensor = true,
+                 .native_code_address = program_base + native_header_size,
+                 .verified_traps = verified_traps,
+                 .tessellation_stage = tessellation_stage});
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
@@ -523,6 +550,24 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             std::ofstream dump(path, std::ios::binary);
             dump.write(reinterpret_cast<const char*>(native.data()),
                        native.size() * sizeof(Shader::Ampere::Instruction));
+        }
+        if (native_header_size != 0) {
+            auto header_path = path;
+            header_path.replace_extension(".header.bin");
+            if (!std::filesystem::exists(header_path) &&
+                gpu_memory->IsFullyMappedRange(program_base, native_header_size)) {
+                std::vector<u8> header(native_header_size);
+                gpu_memory->ReadBlock(program_base, header.data(), header.size());
+                std::ofstream dump(header_path, std::ios::binary);
+                dump.write(reinterpret_cast<const char*>(header.data()), header.size());
+                dump.close();
+                if (dump) {
+                    LOG_INFO(Shader, "Captured native shader header at {:#x}: {} bytes, path={}",
+                             program_base, header.size(), header_path.string());
+                } else {
+                    LOG_ERROR(Shader, "Cannot write native shader header {}", header_path.string());
+                }
+            }
         }
     }
     if (!lowered) {
@@ -619,19 +664,82 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     const auto& regs{maxwell3d->regs};
     const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
+    static const bool geometry_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_EXPERIMENTAL_GEOMETRY");
+        return !value || std::string_view{value} != "0";
+    }();
+    const bool geometry{native && program == Maxwell::ShaderType::Geometry && geometry_enabled};
     // Task and mesh programs: the task in the vertex slot, its mesh program in the tessellation
     // slot (without a task, the mesh program is in the vertex slot).
     const bool mesh_slot{native && regs.IsMeshEnabled() &&
                          (program == Maxwell::ShaderType::VertexB ||
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
+        const bool tessellation =
+            (program == Maxwell::ShaderType::TessellationInit ||
+             program == Maxwell::ShaderType::Tessellation) &&
+            sph.common0.shader_type == static_cast<u32>(program);
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            program != Maxwell::ShaderType::Geometry && !mesh_slot) {
+            !geometry && !mesh_slot && !tessellation) {
+            if (const char* directory = std::getenv("EDEN_NX2_SHADER_DUMP"); directory &&
+                gpu_memory->IsFullyMappedRange(program_base, 128)) {
+                constexpr u32 MaxCaptureInstructions = 4096;
+                std::array<u8, 128> header{};
+                gpu_memory->ReadBlock(program_base, header.data(), header.size());
+                std::vector<Shader::Ampere::Instruction> instructions;
+                Shader::Ampere::ProgramCaptureState capture;
+                auto status = Shader::Ampere::ProgramCaptureState::Result::Continue;
+                NativeInstructionReader reader{*gpu_memory};
+                for (u32 index = 0; index < MaxCaptureInstructions; ++index) {
+                    const GPUVAddr address = program_base + header.size() + index * 16;
+                    Shader::Ampere::Instruction instruction;
+                    if (!reader.TryRead(address, instruction)) {
+                        if (!gpu_memory->IsFullyMappedRange(address, sizeof(instruction))) {
+                            break;
+                        }
+                        gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+                    }
+                    instructions.push_back(instruction);
+                    status = capture.Observe(instruction, index);
+                    if (status != Shader::Ampere::ProgramCaptureState::Result::Continue) {
+                        break;
+                    }
+                }
+                const auto folder = std::filesystem::path{directory};
+                std::error_code error;
+                std::filesystem::create_directories(folder, error);
+                if (error) {
+                    LOG_ERROR(Shader, "Cannot create rejected shader dump directory: {}",
+                              error.message());
+                } else {
+                    const auto path = folder / fmt::format("rejected-stage-{}-{:x}.bin",
+                                                          static_cast<u32>(program), program_base);
+                    std::ofstream dump(path, std::ios::binary);
+                    dump.write(reinterpret_cast<const char*>(header.data()), header.size());
+                    dump.write(reinterpret_cast<const char*>(instructions.data()),
+                               instructions.size() * sizeof(Shader::Ampere::Instruction));
+                    dump.close();
+                    if (dump) {
+                        LOG_INFO(Shader,
+                                 "Captured rejected native stage {} at {:#x}: {} header bytes, "
+                                 "{} instructions, complete={}, invalid_target={}, path={}",
+                                 static_cast<u32>(program), program_base, header.size(),
+                                 instructions.size(),
+                                 status == Shader::Ampere::ProgramCaptureState::Result::Complete,
+                                 status == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget,
+                                 path.string());
+                    } else {
+                        LOG_ERROR(Shader, "Cannot write rejected shader dump {}", path.string());
+                    }
+                }
+            }
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
             const u32 native_stage = program == Maxwell::ShaderType::Pixel ? 4 :
-                                     program == Maxwell::ShaderType::Geometry ? 3 : 0;
+                                     program == Maxwell::ShaderType::Geometry ? 3 :
+                                     program == Maxwell::ShaderType::Tessellation ? 2 :
+                                     program == Maxwell::ShaderType::TessellationInit ? 1 : 0;
             const auto& table = maxwell3d->state.shader_stages[native_stage].const_buffers[1];
             if (table.enabled && table.size && table.size <= Tegra::Engines::Maxwell3D::Regs::MaxConstBufferSize) {
                 std::vector<u8> bytes(table.size);
@@ -640,8 +748,6 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 dump.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             }
         }
-        InitializeNativeCode(std::move(lowered_native_), 128,
-                             program == Maxwell::ShaderType::Geometry);
     }
     gp_passthrough_mask = maxwell3d->regs.post_vtg_shader_attrib_skip_mask;
     switch (program) {
@@ -680,11 +786,25 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         mesh_registers = {regs.reg_array[Maxwell::MeshShaderA], regs.reg_array[Maxwell::MeshShaderB],
                           regs.reg_array[Maxwell::MeshInitShader]};
         if (stage == Shader::Stage::Mesh && regs.IsShaderConfigEnabled(Maxwell::ShaderType::Geometry)) {
-            const auto& geometry{regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
-            const GPUVAddr address{(static_cast<u64>(geometry.reserved[0] & 0xff) << 32) |
-                                   geometry.reserved[1]};
+            const auto& geometry_pipeline{
+                regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
+            const GPUVAddr address{(static_cast<u64>(geometry_pipeline.reserved[0] & 0xff) << 32) |
+                                   geometry_pipeline.reserved[1]};
             gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
         }
+    }
+    if (native) {
+        if (!lowered_native_ && std::getenv("EDEN_NX2_SHADER_DUMP") &&
+            (stage == Shader::Stage::TessellationControl || stage == Shader::Stage::TessellationEval)) {
+            LOG_INFO(Shader,
+                     "Native tessellation context at {:#x}: stage={} domain={} spacing={} output={} patch_vertices={}",
+                     program_base, static_cast<u32>(stage),
+                     static_cast<u32>(regs.tessellation.params.domain_type.Value()),
+                     static_cast<u32>(regs.tessellation.params.spacing.Value()),
+                     static_cast<u32>(regs.tessellation.params.output_primitives.Value()),
+                     regs.patch_vertices);
+        }
+        InitializeNativeCode(std::move(lowered_native_), 128, geometry);
     }
     const u64 local_size{sph.LocalMemorySize()};
     ASSERT(local_size <= (std::numeric_limits<u32>::max)());

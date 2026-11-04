@@ -2,7 +2,7 @@ name: Kirby Windows test
 on:
   workflow_dispatch:
   push:
-    branches: [kirby-test]
+    branches: [kirby-test, kirby-upstream-integration]
 permissions:
   contents: read
 env:

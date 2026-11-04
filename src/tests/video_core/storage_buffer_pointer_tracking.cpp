@@ -8,6 +8,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -173,6 +174,171 @@ TEST_CASE("Native accesses without mapped pointers are not rebased on scalars",
     ir.WriteGlobal32(Address(ir, Word(ir, 0x310), Word(ir, 0x314)), ir.Imm32(1));
     CHECK(fixture.TrackedOffsets().empty());
     CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::WriteGlobal32);
+}
+
+TEST_CASE("Native append counters behind unmapped pointers become storage atomics",
+          "[shader][storage_buffer][global_atomic]") {
+    // Donkey Kong Bananza's compute programs add a ballot count to the counter whose pointer is
+    // at c0[0x1d0], or at c0[0x1e0]. The counter was unmapped when the pipeline was first built.
+    for (const u32 counter : {0x1d0U, 0x1e0U}) {
+        CAPTURE(counter);
+        KernelProgram fixture;
+        fixture.env.native = true;
+        fixture.env.scalar_offsets = {counter};
+        IR::IREmitter ir{fixture.entry};
+        const IR::Value pointer{ir.GetCbuf(ir.Imm32(0), ir.Imm32(counter), 64, false)};
+        const IR::U32 low{ir.CompositeExtract(pointer, 0)};
+        const IR::U32 high{ir.CompositeExtract(pointer, 1)};
+        const IR::Value old{ir.GlobalAtomicIAdd(Address(ir, low, high), ir.Imm32(32))};
+        ir.WriteGlobal32(Address(ir, Word(ir, 0x170), Word(ir, 0x174)), IR::U32{old});
+        const IR::U32 record{ir.IAdd(low, ir.IAdd(IR::U32{old}, ir.Imm32(16)))};
+        ir.WriteGlobal32(Address(ir, record, high), ir.Imm32(1));
+
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x170, counter});
+        CHECK_FALSE(fixture.program.info.native_global_bounds);
+        for (const auto& descriptor : fixture.program.info.storage_buffers_descriptors) {
+            CHECK(descriptor.is_written);
+        }
+        const auto count = [&](IR::Opcode opcode) {
+            return std::ranges::count_if(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        };
+        CHECK(count(IR::Opcode::StorageAtomicIAdd32) == 1);
+        CHECK(count(IR::Opcode::GlobalAtomicIAdd32) == 0);
+        CHECK(count(IR::Opcode::WriteStorage32) == 2);
+        CHECK(count(IR::Opcode::WriteGlobal32) == 0);
+    }
+}
+
+TEST_CASE("Native atomics offset from an unmapped pointer stay global",
+          "[shader][storage_buffer][global_atomic]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x1d0, 0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 low{ir.IAdd(Word(ir, 0x1d0), Word(ir, 0x40))};
+    static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, Word(ir, 0x1d4)), ir.Imm32(1)));
+    CHECK(fixture.TrackedOffsets().empty());
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+}
+
+TEST_CASE("Native atomics carried into an unmapped pointer's high word become storage atomics",
+          "[shader][storage_buffer][global_atomic]") {
+    // Kirby Air Riders compute 0x1175573eed7481a4 adds 64-bit offsets to the pointers at c0[0x40]
+    // and c1[0x0] in 32-bit halves, carrying into the high word. Both were unmapped when the
+    // pipeline was built, which left its atomics without a buffer.
+    const bool dynamic_offset = GENERATE(false, true);
+    CAPTURE(dynamic_offset);
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::Value pointer{ir.GetCbuf(ir.Imm32(0), ir.Imm32(0x40), 64, false)};
+    const IR::U32 pointer_low{ir.CompositeExtract(pointer, 0)};
+    const IR::U32 pointer_high{ir.CompositeExtract(pointer, 1)};
+    const IR::U32 lane{ir.LocalInvocationIdX()};
+    IR::U32 low;
+    IR::U1 carry;
+    IR::U32 high{pointer_high};
+    if (dynamic_offset) {
+        low = ir.IAdd(ir.ShiftLeftLogical(lane, ir.Imm32(4)), pointer_low);
+        carry = ir.GetCarryFromOp(low);
+        high = ir.IAdd(high, ir.ShiftRightLogical(lane, ir.Imm32(28)));
+    } else {
+        low = ir.IAdd(pointer_low, ir.Imm32(0x1c));
+        carry = ir.ILessThan(low, pointer_low, false);
+    }
+    high = ir.IAdd(high, IR::U32{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))});
+    const IR::U64 address{ir.IAdd(Address(ir, low, high), ir.Imm64(u64{8}))};
+    const IR::Value old{ir.GlobalAtomicIAdd(address, ir.Imm32(1))};
+    ir.WriteGlobal32(Address(ir, ir.IAdd(low, IR::U32{old}), high), ir.Imm32(1));
+
+    CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x40});
+    CHECK_FALSE(fixture.program.info.native_global_bounds);
+    CHECK(fixture.program.info.storage_buffers_descriptors.front().is_written);
+    const auto count = [&](IR::Opcode opcode) {
+        return std::ranges::count_if(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+            return inst.GetOpcode() == opcode;
+        });
+    };
+    CHECK(count(IR::Opcode::StorageAtomicIAdd32) == 1);
+    CHECK(count(IR::Opcode::GlobalAtomicIAdd32) == 0);
+    CHECK(count(IR::Opcode::WriteStorage32) == 1);
+    CHECK(count(IR::Opcode::WriteGlobal32) == 0);
+}
+
+TEST_CASE("Native atomics with a carry that skips the pointer stay global",
+          "[shader][storage_buffer][global_atomic]") {
+    KernelProgram fixture;
+    fixture.env.native = true;
+    fixture.env.scalar_offsets = {0x1d0, 0x40};
+    IR::IREmitter ir{fixture.entry};
+    const IR::U32 low{ir.IAdd(Word(ir, 0x1d0), Word(ir, 0x40))};
+    const IR::U1 carry{ir.ILessThan(Word(ir, 0x40), ir.Imm32(16), false)};
+    const IR::U32 carried{ir.Select(carry, ir.Imm32(1), ir.Imm32(0))};
+    const IR::U32 high{ir.IAdd(Word(ir, 0x1d4), carried)};
+    static_cast<void>(ir.GlobalAtomicIAdd(Address(ir, low, high), ir.Imm32(1)));
+    CHECK(fixture.TrackedOffsets().empty());
+    CHECK(fixture.entry.back().GetOpcode() == IR::Opcode::GlobalAtomicIAdd32);
+}
+
+TEST_CASE("Loaded global pointers do not inherit the source buffer descriptor",
+          "[shader][storage_buffer]") {
+    const bool native = GENERATE(false, true);
+    for (const bool add_offset : {false, true}) {
+        KernelProgram fixture;
+        fixture.env.native = native;
+        IR::IREmitter ir{fixture.entry};
+        const auto source = Address(ir, Word(ir, 0x110), Word(ir, 0x114));
+        const auto loaded = ir.LoadGlobal64(source);
+        const IR::U32 low{ir.CompositeExtract(loaded, 0)};
+        const IR::U32 high{ir.CompositeExtract(loaded, 1)};
+        ir.WriteGlobal32(Address(ir, add_offset ? IR::U32{ir.IAdd(low, ir.Imm32(16))} : low, high),
+                         ir.Imm32(1));
+
+        CHECK(fixture.TrackedOffsets() == std::vector<u32>{0x110});
+        const auto has = [&](IR::Opcode opcode) {
+            return std::ranges::any_of(fixture.entry.Instructions(), [=](const IR::Inst& inst) {
+                return inst.GetOpcode() == opcode;
+            });
+        };
+        CHECK(has(IR::Opcode::LoadStorage64));
+        CHECK(has(IR::Opcode::WriteGlobal32));
+        CHECK_FALSE(has(IR::Opcode::WriteStorage32));
+        REQUIRE(fixture.program.info.storage_buffers_descriptors.size() == 1);
+        CHECK_FALSE(fixture.program.info.storage_buffers_descriptors.front().is_written);
+    }
+}
+
+TEST_CASE("NVN fallback descriptors use guest slots rather than compact binding indices",
+          "[shader][storage_buffer]") {
+    Shader::Info info{};
+    info.nvn_buffer_base = 0x310;
+    info.nvn_buffer_used.set(3);
+    info.nvn_buffer_used.set(15);
+    const std::vector<Shader::StorageBufferDescriptor> descriptors{
+        {1, 0x340, 1, false},
+        {0, 0x340, 1, false},
+        {0, 0x400, 1, false},
+        {0, 0x330, 1, false},
+        {0, 0x341, 1, false},
+        {0, 0x410, 1, false},
+        {0, 0x300, 1, false},
+    };
+    const auto selected = [&](const auto& ordered) {
+        std::vector<u32> offsets;
+        for (const auto& descriptor : ordered) {
+            if (Shader::Backend::UsesNvnStorageDescriptor(info, descriptor)) {
+                offsets.push_back(descriptor.cbuf_offset);
+            }
+        }
+        return offsets;
+    };
+    CHECK(selected(descriptors) == std::vector<u32>{0x340, 0x400});
+    auto reversed = descriptors;
+    std::ranges::reverse(reversed);
+    CHECK(selected(reversed) == std::vector<u32>{0x400, 0x340});
 }
 
 TEST_CASE("Iterator analysis handles deep loop-carried shader graphs",

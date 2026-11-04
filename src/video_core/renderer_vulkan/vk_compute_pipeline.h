@@ -8,7 +8,11 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
+#include <span>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
@@ -58,10 +62,22 @@ public:
         return static_cast<bool>(pipeline);
     }
 
+    [[nodiscard]] u64 ShaderHash() const noexcept {
+        return shader_hash;
+    }
+
+    /// Storage images written by the last configured dispatch
+    [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
+        return written_images;
+    }
+
     /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
     static void TickUpscalerTrace();
 
 private:
+    /// Builds the pipeline once, on whichever thread gets here first.
+    void RunBuild();
+
     const Device& device;
     vk::PipelineCache& pipeline_cache;
     GuestDescriptorQueue& guest_descriptor_queue;
@@ -69,6 +85,7 @@ private:
     Shader::Info info;
     u64 shader_hash{};
     u32 num_descriptor_entries{};
+    boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
 
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
@@ -82,6 +99,8 @@ private:
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 
+    std::function<void()> build_task;
+    std::atomic_bool build_claimed{false};
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
