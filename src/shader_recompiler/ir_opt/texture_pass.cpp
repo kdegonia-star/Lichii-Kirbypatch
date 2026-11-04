@@ -62,7 +62,30 @@ std::pair<IR::Value, bool> Condition(IR::Value value) {
     return {value.Resolve(), negated};
 }
 
+IR::Value ResolveSelfPhi(IR::Value value) {
+    std::unordered_set<const IR::Inst*> visited;
+    while (value.Resolve().IsPhi()) {
+        const IR::Inst* phi = value.InstRecursive();
+        if (!visited.insert(phi).second) break;
+        std::optional<IR::Value> incoming;
+        bool distinct{};
+        for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
+            const IR::Value candidate = phi->Arg(arg).Resolve();
+            if (!candidate.IsImmediate() && candidate.InstRecursive() == phi) continue;
+            if (incoming && *incoming != candidate) {
+                distinct = true;
+                break;
+            }
+            incoming = candidate;
+        }
+        if (distinct || !incoming) break;
+        value = *incoming;
+    }
+    return value;
+}
+
 IR::Value ResolveConditionalPhi(IR::Value value, const IR::Block* block) {
+    value = ResolveSelfPhi(value);
     if (!value.Resolve().IsPhi() || !(block = ConditionalHeader(block))) return value;
     const auto [condition, negated]{Condition(block->back().Arg(0))};
     boost::container::small_vector<const IR::Block*, 16> visited;
@@ -455,8 +478,9 @@ thread_local int g_handle_depth{};
 bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget,
                      const IR::Block* block);
 
-bool BuildHandleProgram(const IR::Value& value, std::vector<u32>& code, int& budget,
+bool BuildHandleProgram(const IR::Value& input, std::vector<u32>& code, int& budget,
                         const IR::Block* block) {
+    const IR::Value value = ResolveSelfPhi(input);
     using Op = HandleOp;
     if (value.IsImmediate()) {
         return BuildHandleNode(value, code, budget, block);
@@ -937,7 +961,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
 
 // Bound the dump and walk iteratively: handle expressions can contain cyclic Phi nodes.
 void LogFailedHandle(const IR::Inst& texture, const IR::Program& program) {
-    constexpr size_t MaxNodes = 256;
+    constexpr size_t MaxNodes = 1024;
     std::unordered_map<const IR::Inst*, size_t> ids;
     std::vector<const IR::Inst*> pending;
     const auto enqueue = [&](const IR::Inst* node) {

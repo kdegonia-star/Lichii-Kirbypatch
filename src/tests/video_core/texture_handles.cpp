@@ -247,3 +247,18 @@ TEST_CASE("Native unsupported handles do not fall back to an ancestor cbuf",
     shader.Sample(shader.Add(source, varying));
     REQUIRE_THROWS(shader.Run());
 }
+
+TEST_CASE("Native handle self Phi retains its sole external input",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.native_program = true;
+    const Value source{shader.Storage(0)};
+    const Value phi{shader.Emit(Opcode::Phi)};
+    phi.Inst()->SetFlags(IR::Type::U32);
+    phi.Inst()->AddPhiOperand(&shader.left, source);
+    phi.Inst()->AddPhiOperand(&shader.right, phi);
+    auto& sample{shader.Sample(phi)};
+    shader.Run();
+    CHECK(shader.Evaluate(sample, 0x1234) == 0x1234);
+    CHECK(shader.Evaluate(sample, 0x5678) == 0x5678);
+}
