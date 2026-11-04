@@ -3,11 +3,14 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/logging.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/memory.h"
 
 namespace Core {
 
@@ -41,6 +44,37 @@ void ArmInterface::LogBacktrace(Kernel::KProcess* process) const {
     for (auto const& entry : backtrace)
         msg += fmt::format("{:20}{:016X}    {:016X}    {:016X}    {}\n", entry.module, entry.address, entry.original_address, entry.offset, entry.name);
     LOG_ERROR(Core_ARM, "{}", msg);
+
+    if (process && std::getenv("EDEN_PANIC_CONTEXT")) {
+        auto& memory = process->GetMemory();
+        const auto log_text = [&](std::string_view source, u64 address) {
+            std::string text;
+            for (u64 i = 0; i < 192; ++i) {
+                if (address + i < address || !memory.IsValidVirtualAddress(address + i)) return;
+                const u8 ch = memory.Read8(address + i);
+                if (ch == 0) {
+                    if (text.size() >= 6) {
+                        LOG_ERROR(Core_ARM, "Guest failure text {} at {:#x}: {}", source, address,
+                                  text);
+                    }
+                    return;
+                }
+                if ((ch < 32 || ch > 126) && ch != '\n' && ch != '\t') return;
+                text.push_back(static_cast<char>(ch));
+            }
+        };
+        for (size_t i = 0; i < xreg.size(); ++i) {
+            log_text(fmt::format("R{}", i), xreg[i]);
+        }
+        // A bounded window can retain the original assertion arguments after abort wrappers.
+        for (u64 offset = 0; offset < 512; offset += sizeof(u64)) {
+            const u64 address = ctx.sp + offset;
+            if (address < ctx.sp || !memory.IsValidVirtualAddressRange(address, sizeof(u64))) break;
+            const u64 value = memory.Read64(address);
+            LOG_ERROR(Core_ARM, "Guest failure stack SP+{:#x}: {:#018x}", offset, value);
+            log_text(fmt::format("SP+{:#x}", offset), value);
+        }
+    }
 }
 
 const Kernel::DebugWatchpoint* ArmInterface::MatchingWatchpoint(
