@@ -415,6 +415,12 @@ std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, c
         if (IsMemoryLoad(inst->GetOpcode())) {
             continue;
         }
+        // Native computed handles must retain their operations, not just an ancestor cbuf.
+        if (env.IsNativeProgram() && inst->GetOpcode() != IR::Opcode::Identity &&
+            inst->GetOpcode() != IR::Opcode::ConditionRef &&
+            inst->GetOpcode() != IR::Opcode::ShuffleIndex) {
+            continue;
+        }
         for (size_t arg = inst->NumArgs(); arg--;) {
             const IR::Value arg_value{ResolveConditionalPhi(inst->Arg(arg), block)};
             if (arg_value.IsImmediate()) {
@@ -831,11 +837,19 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         }
         std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
         if (lhs) {
+            if (env.IsNativeProgram() &&
+                (lhs->has_secondary || lhs->shift_left != 0 || shift.U32() >= 32)) {
+                return std::nullopt;
+            }
             lhs->shift_left = shift.U32();
         }
         return lhs;
     }
     case IR::Opcode::BitwiseAnd32: {
+        // The static descriptor represents shifts, but cannot preserve an arbitrary mask.
+        if (env.IsNativeProgram()) {
+            return std::nullopt;
+        }
         IR::Value op1{inst->Arg(0)};
         IR::Value op2{inst->Arg(1)};
         if (op1.IsImmediate()) {
@@ -935,6 +949,11 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
             if (!g_handle_programs || !BuildHandleProgram(inst.Arg(0), code, budget, block)) {
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
+                if (env.IsNativeProgram()) {
+                    throw NotImplementedException(
+                        "Failed to preserve native texture handle (stopped at {}, budget {})",
+                        g_handle_failure, budget);
+                }
                 const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
                     [&env, &host_info, block](const IR::Inst* candidate) {
                         return TryGetConstBuffer(candidate, env, host_info, block);

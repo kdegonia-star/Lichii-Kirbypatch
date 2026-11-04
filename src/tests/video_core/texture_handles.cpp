@@ -17,6 +17,8 @@ using IR::Value;
 class HandleEnvironment final : public Shader::Environment {
 public:
     bool integer_texture{};
+    bool native_program{};
+    bool IsNativeProgram() const override { return native_program; }
     u32 format_reads{};
 
     u64 ReadInstruction(u32) override { throw std::logic_error("Unexpected instruction read"); }
@@ -206,4 +208,42 @@ TEST_CASE("Failed Phi handle subtrees discard their cached values",
                   0x5678 + 7 + (nested ? 0x90 : 0) + (retained_slot ? 2 * 0x90 : 0));
         }
     }
+}
+
+TEST_CASE("Native texture handles preserve arithmetic and masks",
+          "[video_core][texture_handles]") {
+    for (const bool masked : {false, true}) {
+        HandleProgram shader;
+        shader.env.native_program = true;
+        const Value source{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+        const Value handle{masked
+                               ? shader.Emit(Opcode::BitwiseAnd32, {source, Value{0xffU}})
+                               : shader.Add(source, Value{16U})};
+        auto& sample{shader.Sample(handle)};
+        shader.Run();
+        const u32 index{shader.Descriptor(sample).handle_program};
+        REQUIRE(index < shader.program.info.handle_programs.size());
+        for (const u32 value : {0xabcU, 0x1234U}) {
+            const auto result{Shader::EvaluateHandleProgram(
+                shader.program.info.handle_programs[index],
+                [value](u32 bank, u32 offset) {
+                    REQUIRE(bank == 0);
+                    REQUIRE(offset == 0);
+                    return value;
+                },
+                [](u32, u32) -> u32 { throw std::logic_error("Unexpected storage read"); })};
+            REQUIRE(result.has_value());
+            CHECK(*result == (masked ? value & 0xffU : value + 16U));
+        }
+    }
+}
+
+TEST_CASE("Native unsupported handles do not fall back to an ancestor cbuf",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.native_program = true;
+    const Value source{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+    const Value varying{shader.Emit(Opcode::GetRegister, {Value{IR::Reg::R0}})};
+    shader.Sample(shader.Add(source, varying));
+    REQUIRE_THROWS(shader.Run());
 }
