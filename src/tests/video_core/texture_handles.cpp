@@ -262,3 +262,26 @@ TEST_CASE("Native handle self Phi retains its sole external input",
     CHECK(shader.Evaluate(sample, 0x1234) == 0x1234);
     CHECK(shader.Evaluate(sample, 0x5678) == 0x5678);
 }
+
+TEST_CASE("Native shared-memory texture table uses a fixed sampler",
+          "[video_core][texture_handles]") {
+    HandleProgram shader;
+    shader.env.native_program = true;
+    const Value offset{shader.Emit(Opcode::LoadSharedU32, {Value{8U}})};
+    const Value texture{shader.Emit(Opcode::GetCbufU32, {Value{4U}, offset})};
+    const Value sampler{shader.Emit(Opcode::GetCbufU32, {Value{0U}, Value{0U}})};
+    auto& sample{shader.Sample(shader.Emit(Opcode::BitwiseOr32, {texture, sampler}))};
+    shader.Run();
+    const auto& descriptor{shader.Descriptor(sample)};
+    CHECK(descriptor.handle_program == ~0U);
+    CHECK(descriptor.cbuf_index == 4);
+    CHECK(descriptor.cbuf_offset == 0);
+    CHECK(descriptor.has_secondary);
+    CHECK(descriptor.secondary_is_static);
+    CHECK(descriptor.size_shift == 2);
+    CHECK(descriptor.secondary_cbuf_index == 0);
+    CHECK(descriptor.secondary_cbuf_offset == 0);
+    CHECK(descriptor.count > 1);
+    CHECK_FALSE(sample.Arg(0).IsImmediate());
+    CHECK(offset.Inst()->GetOpcode() == Opcode::LoadSharedU32);
+}

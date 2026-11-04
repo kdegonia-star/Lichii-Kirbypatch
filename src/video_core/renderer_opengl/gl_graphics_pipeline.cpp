@@ -327,8 +327,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             if constexpr (std::is_same_v<decltype(desc), const TextureDescriptor&> ||
                           std::is_same_v<decltype(desc), const TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
+                    if (desc.secondary_is_static &&
+                        (offset >= cbufs[desc.cbuf_index].size ||
+                         cbufs[desc.cbuf_index].size - offset < sizeof(u32))) {
+                        return TexturePair(0, via_header_index);
+                    }
                     ASSERT(cbufs[desc.secondary_cbuf_index].enabled);
-                    const u32 second_offset{desc.secondary_cbuf_offset + index_offset};
+                    const u32 second_offset{desc.secondary_cbuf_offset +
+                        (desc.secondary_is_static ? 0U : index_offset)};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
                     const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};

@@ -193,6 +193,8 @@ struct TextureBufferDescriptor {
     /// storage buffer), ~0 when it is the constant buffer word.
     u32 handle_program{~0U};
 
+    bool secondary_is_static{};
+
     auto operator<=>(const TextureBufferDescriptor&) const = default;
 };
 using TextureBufferDescriptors = boost::container::small_vector<TextureBufferDescriptor, 6>;
@@ -231,6 +233,8 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+
+    bool secondary_is_static{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };

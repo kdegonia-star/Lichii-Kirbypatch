@@ -374,17 +374,17 @@ static inline u32 GetTextureHandleCached(Environment& env, const ConstBufferAddr
 // floating-point 2D texture, the instruction's own type deciding the rest (see the TexturePass
 // ImageQueryDimensions case, which has none).
 static inline TextureType ReadTextureTypeCached(Environment& env, const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TextureType::Color2D;
+    if (cbuf.handle_program != ~0U || cbuf.secondary_is_static) return TextureType::Color2D;
     return env.ReadTextureType(GetTextureHandleCached(env, cbuf));
 }
 static inline TexturePixelFormat ReadTexturePixelFormatCached(Environment& env,
                                                                 const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return TexturePixelFormat::A8B8G8R8_UNORM;
+    if (cbuf.handle_program != ~0U || cbuf.secondary_is_static) return TexturePixelFormat::A8B8G8R8_UNORM;
     return env.ReadTexturePixelFormat(GetTextureHandleCached(env, cbuf));
 }
 static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
                                                         const ConstBufferAddr& cbuf) {
-    if (cbuf.handle_program != ~0U) return false;
+    if (cbuf.handle_program != ~0U || cbuf.secondary_is_static) return false;
     return env.IsTexturePixelFormatInteger(GetTextureHandleCached(env, cbuf));
 }
 
@@ -838,7 +838,17 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
             return std::nullopt;
         }
         if (lhs->count > 1 || rhs->count > 1) {
-            return std::nullopt;
+            if (!env.IsNativeProgram() || (lhs->count > 1 && rhs->count > 1)) {
+                return std::nullopt;
+            }
+            if (rhs->count > 1) std::swap(lhs, rhs);
+            // A table of texture words combined with one fixed sampler word.
+            lhs->secondary_index = rhs->index;
+            lhs->secondary_offset = rhs->offset;
+            lhs->secondary_shift_left = rhs->shift_left;
+            lhs->has_secondary = true;
+            lhs->secondary_is_static = true;
+            return lhs;
         }
         if (lhs->shift_left > 0 || lhs->index > rhs->index || lhs->offset > rhs->offset) {
             std::swap(lhs, rhs);
@@ -928,18 +938,15 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
         };
     }
     IR::Inst* const offset_inst{offset.InstRecursive()};
-    if (offset_inst->GetOpcode() != IR::Opcode::IAdd32) {
-        return std::nullopt;
-    }
     u32 base_offset{};
-    IR::U32 dynamic_offset;
-    if (offset_inst->Arg(0).IsImmediate()) {
+    IR::U32 dynamic_offset{offset};
+    if (offset_inst->GetOpcode() == IR::Opcode::IAdd32 && offset_inst->Arg(0).IsImmediate()) {
         base_offset = offset_inst->Arg(0).U32();
         dynamic_offset = IR::U32{offset_inst->Arg(1)};
-    } else if (offset_inst->Arg(1).IsImmediate()) {
+    } else if (offset_inst->GetOpcode() == IR::Opcode::IAdd32 && offset_inst->Arg(1).IsImmediate()) {
         base_offset = offset_inst->Arg(1).U32();
         dynamic_offset = IR::U32{offset_inst->Arg(0)};
-    } else {
+    } else if (!env.IsNativeProgram()) {
         return std::nullopt;
     }
     auto const size_shift = DynamicDescriptorSizeShift(dynamic_offset);
@@ -1126,6 +1133,7 @@ public:
                    desc.secondary_cbuf_index == existing.secondary_cbuf_index &&
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
+                   desc.secondary_is_static == existing.secondary_is_static &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
                    desc.has_secondary == existing.has_secondary &&
                    desc.handle_program == existing.handle_program;
@@ -1155,6 +1163,7 @@ public:
                    desc.secondary_cbuf_index == existing.secondary_cbuf_index &&
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
+                   desc.secondary_is_static == existing.secondary_is_static &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
                    desc.handle_program == existing.handle_program;
         })};
@@ -1293,7 +1302,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     u32 last_cbuf_offset{};
     bool last_is_integer{false};
     const auto is_texture_pixel_format_integer{[&](const ConstBufferAddr& cbuf_addr) {
-        if (cbuf_addr.handle_program != ~0U) {
+        if (cbuf_addr.handle_program != ~0U || cbuf_addr.secondary_is_static) {
             // Every handle program is at cbuf 0 offset 0: the cache below can't tell them apart.
             return IsTexturePixelFormatIntegerCached(env, cbuf_addr);
         }
@@ -1366,7 +1375,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             break;
         }
         u32 index;
-        u32 size_shift = cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT;
+        u32 size_shift = cbuf.secondary_is_static
+                             ? 2U // Native table offsets address individual 32-bit texture words.
+                             : (cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset)
+                                               : DESCRIPTOR_SIZE_SHIFT);
         u32 count = cbuf.count;
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageRead:
@@ -1460,6 +1472,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                     .handle_program = cbuf.handle_program,
+                    .secondary_is_static = cbuf.secondary_is_static,
                 });
             } else {
                 count = std::min(count, sampled_dynamic_cap);
@@ -1479,6 +1492,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                     .handle_program = cbuf.handle_program,
+                    .secondary_is_static = cbuf.secondary_is_static,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }
