@@ -2411,15 +2411,29 @@ private:
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
+    static bool TraceEnabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr;
+        return enabled;
+    }
+
+    // Called with m_mutex held; include the session to separate concurrent previews.
+    void TraceState(std::string_view event) {
+        if (!TraceEnabled()) {
+            return;
+        }
+        LOG_INFO(Service,
+                 "vdec session {} {}: inputs={} decoded={} free={} outputs={} "
+                 "syncpoint={} base={} handed={} ended={} flush={}",
+                 fmt::ptr(this), event, m_inputs.size(), m_decoded.size(), m_free.size(),
+                 m_outputs.size(), m_syncpoint, m_sync_base, m_handed, m_stream_ended, m_flush);
+    }
+
     void Log(HLERequestContext& ctx, std::string_view what) {
         const auto* w = ctx.CommandBuffer();
-        if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand())) {
-            LOG_INFO(Service, "{} TIPC {} {} (first use): words {:08x}", GetServiceName(),
-                     ctx.GetCommand(), what, fmt::join(std::span<const u32>{w, 12}, " "));
-        } else if (static const bool trace = std::getenv("EDEN_NX2_VDEC_TRACE") != nullptr; trace) {
-            // EDEN_NX2_VDEC_TRACE=1: every video decoder call at Info level.
-            LOG_INFO(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
-                     GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
+        if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand()) || TraceEnabled()) {
+            LOG_INFO(Service, "{} session {} TIPC {} {}: words {:08x}", GetServiceName(),
+                     fmt::ptr(this), ctx.GetCommand(), what,
+                     fmt::join(std::span<const u32>{w, 12}, " "));
         } else {
             LOG_DEBUG(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
                       GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
@@ -2614,6 +2628,7 @@ private:
         Log(ctx, ctx.GetCommand() == 8 ? "flush" : "stop");
         {
             std::scoped_lock lk{m_mutex};
+            TraceState("before stop/flush");
             m_inputs.clear();
             m_flush = true;
             m_stream_ended = false;
@@ -2632,6 +2647,7 @@ private:
         Log(ctx, "finalize");
         {
             std::scoped_lock lk{m_mutex};
+            TraceState("finalize");
             CompleteHandedFences();
         }
         TipcReplyWords(ctx, {});
@@ -2656,6 +2672,9 @@ private:
         std::optional<Output> output;
         {
             std::scoped_lock lk{m_mutex};
+            if (m_outputs.empty()) {
+                TraceState("acquire empty");
+            }
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
@@ -2666,6 +2685,10 @@ private:
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
+        }
+        if (TraceEnabled() && output->end) {
+            LOG_INFO(Service, "vdec session {} acquired EOS image {} pts {}",
+                     fmt::ptr(this), output->image, output->pts);
         }
         const u64 pts_ns = output->pts * 1000;
         TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
@@ -2691,6 +2714,7 @@ private:
                 return;
             }
             if (m_flush) {
+                TraceState("worker reset");
                 m_flush = false;
                 m_decoded.clear();
                 if (decoder) {
@@ -2716,6 +2740,9 @@ private:
                 }
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
+                if (m_flush) {
+                    TraceState("image write overlapped stop/flush");
+                }
                 // Even an image written during a flush counts: the client waits for its value.
                 m_outputs.push_back({image, width, height, frame.pts, frame.end});
                 if (frame.end) {
@@ -2730,8 +2757,8 @@ private:
                 }
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
-                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
-                             GetServiceName(), m_frames_out, width, height, frame.pts,
+                    LOG_INFO(Service, "{} session {} frame {} ({}x{}, pts {} us{}) in image {}",
+                             GetServiceName(), fmt::ptr(this), m_frames_out, width, height, frame.pts,
                              frame.end ? ", end of stream" : "", image);
                 }
                 continue;
@@ -2820,6 +2847,8 @@ private:
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
             if (image == m_objects->images.end()) {
+                LOG_WARNING(Service, "vdec session {} write missing image {}",
+                            fmt::ptr(this), image_id);
                 return {m_width, m_height};
             }
             layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
@@ -2829,6 +2858,10 @@ private:
             if (memory != m_objects->memories.end() && memory->second.address != 0) {
                 address = memory->second.address + image->second.offset;
             }
+        }
+        if (address == 0) {
+            LOG_WARNING(Service, "vdec session {} image {} has no backing address",
+                        fmt::ptr(this), image_id);
         }
         if (!frame.picture || decoder == nullptr || address == 0 ||
             system.ApplicationProcess() == nullptr) {
