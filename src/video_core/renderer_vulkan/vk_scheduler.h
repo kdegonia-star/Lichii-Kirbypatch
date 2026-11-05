@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -411,7 +412,13 @@ private:
     void ReportWorkTimes();
     void TraceShader(u64 hash, u32 stage);
 
-    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
+    struct FinishSubmitTrace {
+        std::atomic<u64> worker_start_ns{};
+        std::atomic<u64> queue_start_ns{};
+        std::atomic<u64> queue_end_ns{};
+    };
+    u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                        std::shared_ptr<FinishSubmitTrace> finish_trace = {});
 
     void AllocateNewContext();
 

@@ -249,13 +249,16 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const auto trace_start = wait_trace ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     const u64 known_before = wait_trace ? master_semaphore->KnownGpuTick() : 0;
-    SubmitExecution(signal_semaphore, wait_semaphore);
+    const auto finish_trace = wait_trace ? std::make_shared<FinishSubmitTrace>() : nullptr;
+    const u64 request_ns = wait_trace ? VideoCommon::Nx2Profile::Now() : 0;
+    SubmitExecution(signal_semaphore, wait_semaphore, finish_trace);
     const auto trace_submitted = wait_trace ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
     const u64 known_submitted = wait_trace ? master_semaphore->KnownGpuTick() : 0;
     Wait(presubmit_tick);
     const auto trace_completed = wait_trace ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
+    const u64 completion_observed_ns = wait_trace ? VideoCommon::Nx2Profile::Now() : 0;
     const u64 known_completed = wait_trace ? master_semaphore->KnownGpuTick() : 0;
     AllocateNewContext();
     if (wait_trace) {
@@ -264,6 +267,14 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
             return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
         };
         if (micros(trace_end - trace_start) >= 100000) {
+            const u64 worker_ns = finish_trace->worker_start_ns.load(std::memory_order_acquire);
+            const u64 queue_ns = finish_trace->queue_start_ns.load(std::memory_order_acquire);
+            const u64 returned_ns = finish_trace->queue_end_ns.load(std::memory_order_acquire);
+            LOG_INFO(Render_Vulkan,
+                     "NX2 finish submission target={} request_ns={} worker_start_ns={} "
+                     "queue_start_ns={} queue_return_ns={} completion_observed_ns={}",
+                     presubmit_tick, request_ns, worker_ns, queue_ns, returned_ns,
+                     completion_observed_ns);
             LOG_INFO(Render_Vulkan,
                      "NX2 finish target={} known_before={} known_submitted={} known_completed={} "
                      "submit_us={} wait_us={} context_us={} caller={}:{}",
@@ -782,7 +793,8 @@ void Scheduler::TraceGpuSubmission() {
     trace_gpu_recording = true;
 }
 
-u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                               std::shared_ptr<FinishSubmitTrace> finish_trace) {
     if (VideoCommon::Nx2Profile::Enabled()) {
         g_profile_submits.fetch_add(1, std::memory_order_relaxed);
         ReportSubmitCounts();
@@ -791,8 +803,11 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     InvalidateState();
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, finish_trace,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+        if (finish_trace) {
+            finish_trace->worker_start_ns.store(VideoCommon::Nx2Profile::Now(), std::memory_order_release);
+        }
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -822,8 +837,15 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         }
 
         std::scoped_lock lock{submit_mutex};
-        switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+        if (finish_trace) {
+            finish_trace->queue_start_ns.store(VideoCommon::Nx2Profile::Now(), std::memory_order_release);
+        }
+        const VkResult result = master_semaphore->SubmitQueue(
+            cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value);
+        if (finish_trace) {
+            finish_trace->queue_end_ns.store(VideoCommon::Nx2Profile::Now(), std::memory_order_release);
+        }
+        switch (result) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
