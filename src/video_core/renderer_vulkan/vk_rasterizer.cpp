@@ -63,6 +63,46 @@
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
+namespace {
+class CacheWaitTrace {
+public:
+    explicit CacheWaitTrace(const char* operation_, u64 address_ = 0, u64 size_ = 0)
+        : operation{operation_}, address{address_}, size{size_} {
+        if (Enabled()) {
+            last = std::chrono::steady_clock::now();
+        }
+    }
+
+    void Step(const char* phase) {
+        if (!Enabled()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+        last = now;
+        if (us < 10000) {
+            return;
+        }
+        static thread_local u64 slow_count{};
+        if (++slow_count <= 64 || slow_count % 128 == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "NX2 cache wait operation={} phase={} address={:#x} size={} elapsed_us={}",
+                     operation, phase, address, size, us);
+        }
+    }
+
+private:
+    static bool Enabled() {
+        static const bool enabled = std::getenv("EDEN_NX2_WAIT_TRACE") != nullptr;
+        return enabled;
+    }
+    const char* operation;
+    u64 address;
+    u64 size;
+    std::chrono::steady_clock::time_point last{};
+};
+} // namespace
+
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
@@ -1573,15 +1613,21 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
         return;
     }
 
+    CacheWaitTrace trace{"invalidate region", addr, size};
     {
         std::scoped_lock lock{texture_cache.mutex};
+        trace.Step("texture lock");
         texture_cache.WriteMemory(addr, size);
+        trace.Step("texture write");
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
+        trace.Step("buffer lock");
         buffer_cache.WriteMemory(addr, size);
+        trace.Step("buffer write/download");
     }
     pipeline_cache.InvalidateRegion(addr, size);
+    trace.Step("pipeline invalidate");
 }
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
@@ -1601,7 +1647,9 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::InvalidateGPUCache() {
+    CacheWaitTrace trace{"gather dirty memory"};
     gpu.InvalidateGPUCache();
+    trace.Step("gather and callbacks");
 }
 
 void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
@@ -1665,19 +1713,26 @@ void RasterizerVulkan::WaitForIdle() {
         flags |= VK_PIPELINE_STAGE_TRANSFORM_FEEDBACK_BIT_EXT;
     }
 
+    CacheWaitTrace trace{"wait for idle"};
     query_cache.NotifyWFI();
+    trace.Step("query notify");
 
     if (device.IsMoltenVK() && scheduler.IsRenderPassActive()) {
         scheduler.DeferFragmentBarrier();
+        trace.Step("record barrier");
         fence_manager.SignalOrdering();
+        trace.Step("signal ordering");
         return;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
+    trace.Step("end render pass");
     scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetEvent(event, flags);
         cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
     });
+    trace.Step("record barrier");
     fence_manager.SignalOrdering();
+    trace.Step("signal ordering");
 }
 
 void RasterizerVulkan::FragmentBarrier() {
