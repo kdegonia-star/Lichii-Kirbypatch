@@ -245,9 +245,33 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     const u64 presubmit_tick = CurrentTick();
     const bool profile = VideoCommon::Nx2Profile::Enabled();
     const u64 start = profile ? VideoCommon::Nx2Profile::Now() : 0;
+    static const bool wait_trace = std::getenv("EDEN_NX2_WAIT_TRACE") != nullptr;
+    const auto trace_start = wait_trace ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+    const u64 known_before = wait_trace ? master_semaphore->KnownGpuTick() : 0;
     SubmitExecution(signal_semaphore, wait_semaphore);
+    const auto trace_submitted = wait_trace ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    const u64 known_submitted = wait_trace ? master_semaphore->KnownGpuTick() : 0;
     Wait(presubmit_tick);
+    const auto trace_completed = wait_trace ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
+    const u64 known_completed = wait_trace ? master_semaphore->KnownGpuTick() : 0;
     AllocateNewContext();
+    if (wait_trace) {
+        const auto trace_end = std::chrono::steady_clock::now();
+        const auto micros = [](auto duration) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        };
+        if (micros(trace_end - trace_start) >= 100000) {
+            LOG_INFO(Render_Vulkan,
+                     "NX2 finish target={} known_before={} known_submitted={} known_completed={} "
+                     "submit_us={} wait_us={} context_us={} caller={}:{}",
+                     presubmit_tick, known_before, known_submitted, known_completed,
+                     micros(trace_submitted - trace_start), micros(trace_completed - trace_submitted),
+                     micros(trace_end - trace_completed), location.file_name(), location.line());
+        }
+    }
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     if (profile) {
