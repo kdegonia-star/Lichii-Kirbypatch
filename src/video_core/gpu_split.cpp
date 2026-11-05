@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <thread>
 
@@ -30,6 +31,28 @@
 namespace VideoCommon {
 
 namespace {
+
+template <typename F>
+void TraceMethodWait(const void* engine, u32 method, u32 argument, const char* phase, F&& call) {
+    static const bool enabled = std::getenv("EDEN_NX2_WAIT_TRACE") != nullptr;
+    if (!enabled) {
+        call();
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    call();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+    if (us >= 10000) {
+        static thread_local u64 slow_count{};
+        ++slow_count;
+        if (slow_count <= 32 || slow_count % 128 == 0) {
+            LOG_INFO(HW_GPU, "NX2 slow method engine={} method={:#x} argument={:#x} "
+                             "phase={} elapsed_us={} slow_count={}",
+                     engine, method, argument, phase, us, slow_count);
+        }
+    }
+}
 
 void Pause() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
@@ -306,17 +329,21 @@ size_t GpuSplit::Execute(const u64* entry) {
         auto* const engine = back_engine;
         if ((head & Direct) != 0) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
-            engine->CallMethod(*system, method, argument, true);
+            TraceMethodWait(engine, method, 0, "consume sink", [&] { engine->ConsumeSink(*system); });
+            TraceMethodWait(engine, method, argument, "call", [&] {
+                engine->CallMethod(*system, method, argument, true);
+            });
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
+            TraceMethodWait(engine, method, 0, "consume sink", [&] { engine->ConsumeSink(*system); });
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
             }
-            engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+            TraceMethodWait(engine, method, argument, "call", [&] {
+                engine->CallMethod(*system, method, argument, (head & IsLast) != 0);
+            });
         }
         return (head & HasSegment) != 0 ? 2 : 1;
     }
@@ -326,12 +353,14 @@ size_t GpuSplit::Execute(const u64* entry) {
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-        engine->ConsumeSink(*system);
+        TraceMethodWait(engine, method, 0, "consume sink", [&] { engine->ConsumeSink(*system); });
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
         }
-        engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
+        TraceMethodWait(engine, method, amount, "multi count", [&] {
+            engine->CallMultiMethod(*system, method, reinterpret_cast<const u32*>(entry + data),
                                 amount, static_cast<u32>(entry[1]));
+        });
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
