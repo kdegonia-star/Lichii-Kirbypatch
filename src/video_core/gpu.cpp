@@ -8,11 +8,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <utility>
 
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -107,10 +109,47 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+        static const bool trace = std::getenv("EDEN_NX2_WAIT_TRACE") != nullptr;
+        if (!trace) {
+            std::function<void(PAddr, size_t)> callback([this](PAddr address, size_t size) {
+                renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+            });
+            system.GatherGPUDirtyMemory(callback);
+            return;
+        }
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        u64 count{}, bytes{}, slow_count{};
+        s64 callback_us{}, max_us{};
+        PAddr max_address{};
+        size_t max_size{};
+        std::function<void(PAddr, size_t)> callback([&](PAddr address, size_t size) {
+            const auto callback_start = Clock::now();
             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                Clock::now() - callback_start).count();
+            ++count;
+            bytes += size;
+            callback_us += us;
+            slow_count += us >= 10000;
+            if (us > max_us) {
+                max_us = us;
+                max_address = address;
+                max_size = size;
+            }
         });
-        system.GatherGPUDirtyMemory(callback_writes);
+        system.GatherGPUDirtyMemory(callback);
+        const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  Clock::now() - start).count();
+        // One summary per severe stall; startup events cannot exhaust its reporting budget.
+        if (total_us >= 500000) {
+            LOG_INFO(HW_GPU,
+                     "NX2 dirty gather total_us={} callback_us={} outside_callbacks_us={} "
+                     "callbacks={} bytes={} slow_callbacks={} max_callback_us={} "
+                     "max_address={:#x} max_size={}",
+                     total_us, callback_us, total_us - callback_us, count, bytes, slow_count,
+                     max_us, max_address, max_size);
+        }
     }
 
     /// Signal the ending of command list.
