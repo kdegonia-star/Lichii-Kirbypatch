@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <cstdlib>
+
+#include "common/logging.h"
 #include <set>
 #include <tuple>
 
@@ -16,6 +19,26 @@
 
 namespace Tegra::Engines {
 namespace {
+
+void TraceLargeDraw(const Maxwell3D& engine, const char* source, u32 instances) {
+    static const bool enabled = std::getenv("EDEN_NX2_WAIT_TRACE") != nullptr;
+    if (!enabled || instances < 4096) {
+        return;
+    }
+    const auto& state = engine.draw_manager.draw_state;
+    const auto& regs = engine.regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                   regs.pipelines[1].reserved[1];
+    const u64 fs = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                   regs.pipelines[5].reserved[1];
+    LOG_INFO(HW_GPU,
+             "NX2 large draw source={} instances={} batch_instances={} drawn_instances={} "
+             "mode={} vertex_count={} index_count={} base_instance={} base_vertex={} "
+             "vs_address={:#x} fs_address={:#x}",
+             source, instances, state.instance_count, state.drawn_instances,
+             static_cast<u32>(state.draw_mode), state.vertex_buffer.count, state.index_buffer.count,
+             state.base_instance, state.base_index, vs, fs);
+}
 
 void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
     if (!VideoCommon::RenderTrace::Enabled()) {
@@ -145,6 +168,7 @@ void Maxwell3D::DrawManager::DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::Pr
     draw_state.vertex_buffer.first = vertex_first;
     draw_state.vertex_buffer.count = vertex_count;
     draw_state.base_instance = base_instance;
+    TraceLargeDraw(maxwell3d, "DrawArray explicit", num_instances);
     ProcessDraw(maxwell3d, false, num_instances);
 }
 
@@ -169,6 +193,7 @@ void Maxwell3D::DrawManager::DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::Pr
     draw_state.index_buffer.count = index_count;
     draw_state.base_index = base_index;
     draw_state.base_instance = base_instance;
+    TraceLargeDraw(maxwell3d, "DrawIndex explicit", num_instances);
     ProcessDraw(maxwell3d, true, num_instances);
 }
 
@@ -246,6 +271,7 @@ void Maxwell3D::DrawManager::DrawBegin(Maxwell3D& maxwell3d) {
 }
 
 void Maxwell3D::DrawManager::DrawEnd(Maxwell3D& maxwell3d, u32 instance_count, bool force_draw) {
+    TraceLargeDraw(maxwell3d, force_draw ? "DrawEnd forced batch" : "DrawEnd", instance_count);
     switch (draw_state.draw_mode) {
     case DrawMode::Instance:
         if (!force_draw) {
