@@ -19,6 +19,7 @@
 #include <fmt/format.h>
 #include <openssl/evp.h>
 #include <zstd.h>
+#include <zstd_errors.h>
 
 #include "core/file_sys/vfs/vfs.h"
 
@@ -32,6 +33,7 @@ constexpr size_t PeekBytes = 64 * 1024;           // what a compressed file show
 constexpr int MaxDepth = 12;
 constexpr std::array<u8, 4> ControlMagic{0x34, 0x12, 0x76, 0x98};
 constexpr std::array<u8, 8> BnshMagic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
+constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u32 KeyControl = 0x48;                  // control bytes in a fingerprint
 
 struct Bad : std::runtime_error {
@@ -314,10 +316,16 @@ public:
             // Large media and data: only a container at the start would be read whole.
             const auto head = Read([&] { return file->ReadBytes(PeekBytes, 0); });
             stats.file_bytes += head.size();
-            if (!LooksLikeContainer(head)) {
+            if (LooksLikeContainer(head) && !IsZstd(head)) {
+                errors.push_back(path + ": container larger than 1 GiB was not read");
                 return;
             }
-            errors.push_back(path + ": container larger than 1 GiB was not read");
+            // A pack of separately compressed members (Kirby Air Riders' 16.6 GB asset file):
+            // its zstd frames, read a window at a time.
+            std::scoped_lock large{turns.large};
+            if (!LargeFrames(file, size, path) && IsZstd(head)) {
+                errors.push_back(path + ": zstd frame larger than 64 MiB was not read");
+            }
             return;
         }
         std::unique_lock large{turns.large, std::defer_lock};
@@ -330,6 +338,34 @@ public:
     }
 
 private:
+    /// The zstd frames of a file too large to read whole, a window of LargeFile bytes at a
+    /// time; a frame that runs past a window's end starts the next window. A frame larger than
+    /// a window is not read, and a file whose first 1 GiB holds no frame (media, or data in
+    /// another form) is not read further. Whether any frame was found.
+    bool LargeFrames(const VirtualFile& file, size_t size, const std::string& path) {
+        const u64 frames_before = stats.embedded_frames + stats.embedded_failed;
+        const auto any_frame = [&] {
+            return stats.embedded_frames + stats.embedded_failed != frames_before;
+        };
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t want = std::min(LargeFile, size - offset);
+            const auto window = Read([&] { return file->ReadBytes(want, offset); });
+            if (window.empty()) {
+                break;
+            }
+            stats.file_bytes += window.size();
+            const bool last = offset + window.size() >= size;
+            const size_t used = EmbeddedZstd(window, path, 0, last, offset);
+            // Step back to a frame cut by the window's end, unless it fills the whole window.
+            offset += used != 0 ? used : window.size();
+            if (offset >= MaxBlob && !any_frame()) {
+                break;
+            }
+        }
+        return any_frame();
+    }
+
     template <typename F>
     std::vector<u8> Read(F&& read) {
         std::unique_lock lock{turns.reads, std::defer_lock};
@@ -408,10 +444,105 @@ private:
             Ndve(data, label);
         } else {
             // BNSH files, and BNSH inside other data (BFSHA archives, effect bundles, layouts).
-            if (!EmbeddedBnsh(data, label)) {
-                SeadPrimitive(data, label);
+            if (!EmbeddedBnsh(data, label) && !SeadPrimitive(data, label)) {
+                BarePrograms(data, label);
+                EmbeddedZstd(data, label, depth, true);
             }
         }
+    }
+
+    /// NVN2 programs stored bare in data no reader here knows: a control section followed by its
+    /// code (Kirby Air Riders' PMAP members hold a vertex and a pixel program, or a compute one,
+    /// this way). The programs of one piece of data are recorded as drawn together only when it
+    /// holds at most one of each stage; otherwise each is a variation of its own.
+    void BarePrograms(Bytes data, const std::string& label) {
+        struct Piece {
+            Stage stage;
+            size_t base;
+            Bytes control, code;
+        };
+        std::vector<Piece> pieces;
+        auto it = data.begin();
+        while ((it = std::search(it, data.end(), ControlMagic.begin(), ControlMagic.end())) !=
+               data.end()) {
+            const size_t base = static_cast<size_t>(it - data.begin());
+            ++it;
+            if (data.size() - base < KeyControl || !IsNvn2Control(data.subspan(base, KeyControl))) {
+                continue;
+            }
+            const size_t own = std::max<size_t>(Load<u32>(data, base + 0x30), KeyControl);
+            const size_t n = Load<u32>(data, base + 0x44);
+            if (n < 4 || own > data.size() - base || n > data.size() - base - own) {
+                continue;
+            }
+            const auto control = data.subspan(base, own);
+            const auto code = data.subspan(base + own, n);
+            const auto stage = Nvn2Stage(control, code);
+            if (!stage) {
+                continue;
+            }
+            pieces.push_back({*stage, base, control, code});
+            it = data.begin() + static_cast<std::ptrdiff_t>(base + own + n);
+        }
+        if (pieces.empty()) {
+            return;
+        }
+        ++stats.containers;
+        std::unordered_set<Stage> stages;
+        bool one_each = true;
+        for (const auto& piece : pieces) {
+            one_each = one_each && stages.insert(piece.stage).second;
+        }
+        for (const auto& piece : pieces) {
+            const std::string variation =
+                one_each ? label : fmt::format("{}#program@{:#x}", label, piece.base);
+            Emit(piece.stage, piece.control, piece.code, label, variation);
+        }
+    }
+
+    /// Zstd frames inside data no reader here knows, such as a pack of separately compressed
+    /// members behind its own catalog (Kirby Air Riders): each frame is inflated and walked like
+    /// a file of its own. A frame must parse to its end inside the data before it is inflated,
+    /// so a stray magic costs no inflation; one that still fails is counted, not reported, since
+    /// the frame was only a guess. Unless `whole`, the data is a window of a larger file: a
+    /// frame cut by its end stops the scan, and its offset is returned (0 when none was cut).
+    /// `origin` is the data's offset in `label`'s file, for the frames' labels.
+    size_t EmbeddedZstd(Bytes data, const std::string& label, int depth, bool whole,
+                        size_t origin = 0) {
+        size_t base = 0;
+        while (base + ZstdMagic.size() <= data.size()) {
+            const auto* const start = data.data() + base;
+            const auto* const hit = static_cast<const u8*>(
+                std::memchr(start, ZstdMagic[0], data.size() - base - (ZstdMagic.size() - 1)));
+            if (!hit) {
+                return 0;
+            }
+            base = static_cast<size_t>(hit - data.data());
+            if (std::memcmp(hit, ZstdMagic.data(), ZstdMagic.size()) != 0) {
+                ++base;
+                continue;
+            }
+            const size_t size = ZSTD_findFrameCompressedSize(hit, data.size() - base);
+            if (ZSTD_isError(size)) {
+                if (!whole && base != 0 &&
+                    ZSTD_getErrorCode(size) == ZSTD_error_srcSize_wrong) {
+                    return base; // runs past the window: the next window starts here
+                }
+                ++base;
+                continue;
+            }
+            const std::string where = fmt::format("{}#zstd@{:#x}", label, origin + base);
+            try {
+                const auto inner = Inflate(zstd, context, data.subspan(base, size), MaxBlob);
+                ++stats.embedded_frames;
+                stats.inflated_bytes += inner.size();
+                Guard(where, [&] { Walk(inner, where, depth + 1); });
+            } catch (const Bad&) {
+                ++stats.embedded_failed;
+            }
+            base += size;
+        }
+        return 0;
     }
 
     void Emit(Stage stage, Bytes control, Bytes code, std::string origin, std::string variation) {
@@ -746,9 +877,9 @@ private:
 
     // sead's NVN2 primitive drawer: four u32 offsets (vertex control, pixel control, vertex
     // code, pixel code); each control section names its own length (+0x30) and its code's (+0x44).
-    void SeadPrimitive(Bytes d, const std::string& label) {
+    bool SeadPrimitive(Bytes d, const std::string& label) {
         if (d.size() < 0x10 || d.size() > (1u << 20)) {
-            return;
+            return false;
         }
         const u32 vc = Load<u32>(d, 0), pc = Load<u32>(d, 4), vk = Load<u32>(d, 8),
                   pk = Load<u32>(d, 12);
@@ -761,20 +892,20 @@ private:
                                           std::tuple{Stage::Fragment, pc, pk}}) {
             if (c < 0x10 || u64{c} + KeyControl > d.size() ||
                 !IsNvn2Control(d.subspan(c, KeyControl))) {
-                return;
+                return false;
             }
             const u32 own = std::max<u32>(Load<u32>(d, c + 0x30), KeyControl);
             if (u64{c} + own > d.size()) {
-                return;
+                return false;
             }
             const auto control = d.subspan(c, own);
             const u32 n = Load<u32>(control, 0x44);
             if (u64{k} + n > d.size()) {
-                return;
+                return false;
             }
             const auto code = d.subspan(k, n);
             if (Nvn2Stage(control, code) != stage) {
-                return;
+                return false;
             }
             pieces.push_back({stage, control, code});
         }
@@ -783,6 +914,7 @@ private:
         for (const auto& piece : pieces) {
             Emit(piece.stage, piece.control, piece.code, variation, variation);
         }
+        return true;
     }
 
     const Zstd& zstd;
@@ -963,6 +1095,8 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
         result.stats.inflated_bytes += stats[i].inflated_bytes;
         result.stats.peeked_only += stats[i].peeked_only;
         result.stats.containers += stats[i].containers;
+        result.stats.embedded_frames += stats[i].embedded_frames;
+        result.stats.embedded_failed += stats[i].embedded_failed;
         result.stats.occurrences += stats[i].occurrences;
     }
     if (dictionary_pack && zstd.Count() == 0) {

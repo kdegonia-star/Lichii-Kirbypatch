@@ -12,7 +12,13 @@ not stall while the driver compiles them.
    movie files and sead's primitive drawer are parsed. For Ocarina of Time it finds, in about 30
    seconds, every program nxnative's build of the game holds (42,848 of 42,854; the others are
    entries nxnative's current `shader_split.py` drops too) and every shader recorded sessions drew,
-   and its variation tables reproduce nxnative's vertex/pixel pair tables. The cutting of programs
+   and its variation tables reproduce nxnative's vertex/pixel pair tables. Data none of these
+   readers knows is searched for zstd frames (each is inflated and read like a file of its own) and
+   for bare NVN2 programs (a control section followed by its code); a file over 1 GiB is read for
+   its frames a window at a time, unless its first 1 GiB holds none. That covers Kirby Air Riders,
+   whose 16.6 GB asset pack holds 194,537 zstd members, each a FlatBuffer with one program or a
+   vertex and pixel pair: 27,567 programs in about a minute, including every vertex, pixel and
+   compute program a recorded race used (9 geometry programs it used are not found). The cutting of programs
    and the fingerprints follow nxnative's `shader_split.py` (github.com/seedds/nxnative, MIT).
    `nx2-precompile scan` then captures and lowers each program as `GenericEnvironment::LowerNativeCode` does, and computes the shader hash
    the emulator will compute at runtime. It then translates each program against a static fact oracle

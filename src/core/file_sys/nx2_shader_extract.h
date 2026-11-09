@@ -51,7 +51,9 @@ struct Stats {
     u64 file_bytes{};          ///< bytes of RomFS files read
     u64 inflated_bytes{};      ///< bytes produced by zstd and Yaz0
     u64 peeked_only{};         ///< compressed files whose content held no container
-    u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files parsed
+    u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files and data with bare programs parsed
+    u64 embedded_frames{};     ///< zstd frames found inside other data and inflated
+    u64 embedded_failed{};     ///< such frames that did not inflate (not reported as errors)
     u64 occurrences{};         ///< programs found, before removing duplicates
 };
 

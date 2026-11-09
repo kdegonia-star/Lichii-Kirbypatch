@@ -1507,8 +1507,9 @@ int Extract(const std::filesystem::path& game_path, const std::filesystem::path&
     }
     const auto& s = result.stats;
     fmt::print("files {} ({:.1f} GB read), inflated {:.1f} GB, compressed files skipped after a "
-               "look {}, containers {}\n",
-               s.files, s.file_bytes / 1e9, s.inflated_bytes / 1e9, s.peeked_only, s.containers);
+               "look {}, containers {}, zstd frames inside other data {} ({} did not inflate)\n",
+               s.files, s.file_bytes / 1e9, s.inflated_bytes / 1e9, s.peeked_only, s.containers,
+               s.embedded_frames, s.embedded_failed);
     fmt::print("programs {} from {} occurrences, variations {}, errors {}, in {:.1f} s\n",
                result.programs.size(), s.occurrences, result.variations.size(),
                result.errors.size(), seconds);
