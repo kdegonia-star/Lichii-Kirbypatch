@@ -292,6 +292,7 @@ struct Turns {
     std::mutex large; ///< held while a large file is read and walked: bounds what workers hold
     std::mutex reads; ///< held while a file is read, when its storage is not thread-safe
     bool serial_reads{};
+    std::stop_token stop; ///< Extract's: also checked between the windows of a large file
 };
 
 /// One extraction worker: its zstd context and the place it reports to.
@@ -348,7 +349,7 @@ private:
             return stats.embedded_frames + stats.embedded_failed != frames_before;
         };
         size_t offset = 0;
-        while (offset < size) {
+        while (offset < size && !turns.stop.stop_requested()) {
             const size_t want = std::min(LargeFile, size - offset);
             const auto window = Read([&] { return file->ReadBytes(want, offset); });
             if (window.empty()) {
@@ -1039,6 +1040,7 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
     std::vector<Stats> stats(count);
     Turns turns;
     turns.serial_reads = serial_reads;
+    turns.stop = stop;
     const auto work = [&](unsigned worker) {
         size_t current = 0;
         Walker walker(
