@@ -295,6 +295,7 @@ jobs:
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
+            -DENABLE_DEBUG_TOOLS=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
             -DUSE_DISCORD_PRESENCE=OFF \
@@ -342,7 +343,7 @@ jobs:
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
           targets="yuzu yuzu-cmd"
-          if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
+          if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater nx2-precompile"; fi
           cmake --build build/release --target $targets --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
@@ -422,12 +423,16 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         shell: pwsh
         run: |
-          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe', 'nx2-precompile.exe') {
             if (-not (Test-Path "build/release/bin/$exe")) {
               throw "build/release/bin/$exe was not produced"
             }
           }
           windeployqt --release --no-translations build/release/bin/lichii.exe
+          $toolsDir = 'build/release/bin/nx2-precompile-tools'
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          Copy-Item -Recurse -Force tools/nx2-precompile/py (Join-Path $toolsDir 'py')
+          Copy-Item -Force tools/nx2-precompile/run_pipeline.sh, tools/nx2-precompile/README.md $toolsDir
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
