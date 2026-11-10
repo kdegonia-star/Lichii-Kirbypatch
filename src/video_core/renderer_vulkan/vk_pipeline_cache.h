@@ -148,7 +148,14 @@ private:
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
-    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+    /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
+    /// pointers whatever they hold now.
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
+        const VideoCommon::EvictedPointerSlots::Slots* keep_pointers = nullptr);
+
+    /// Logs a kept pointer slot (an index of keep_pointers) that this translation would otherwise
+    /// have classified as no pointer: null, unmapped, or out of range right now.
+    void WarnKeptPointer(size_t program, u64 slot) const;
 
     /// Shader cache v2, run-time misses: the stages translated at once on shader_jobs' CPU workers
     /// while the GPU thread waited (VideoCommon::TranslateStages)
@@ -251,6 +258,32 @@ private:
                          std::unordered_set<u64> precached, std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback);
 
+    /// Builds and drops every pipeline of the game's precompiled file (written offline by
+    /// tools/nx2-precompile), so the driver's own cache holds them before they are first drawn.
+    /// Draws never use these pipelines: they build their own from the guest's shaders and find the
+    /// driver's compiled code. Runs once per precompiled file, driver and emulator build.
+    void PreparePrecompiled(const std::filesystem::path& base_dir, std::stop_token stop_loading,
+                            const VideoCore::DiskResourceLoadCallback& callback);
+
+    /// Native pipelines: the key without state that cannot change the pipeline (see
+    /// FixedPipelineState::CanonicalizeNative).
+    void CanonicalizeNativeKey(GraphicsPipelineCacheKey& key,
+                               std::span<const Shader::Environment* const> envs) const noexcept;
+
+    /// Native vertex programs found to load attributes their header does not list: their keys
+    /// keep every attribute type.
+    bool IsUnmaskedVertexProgram(u64 hash) const {
+        if (!any_unmasked_vertex_program.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::scoped_lock lock{unmasked_mutex};
+        return unmasked_vertex_programs.contains(hash);
+    }
+    mutable std::mutex unmasked_mutex;
+    std::unordered_set<u64> unmasked_vertex_programs;
+    std::atomic<bool> any_unmasked_vertex_program{};
+    std::atomic<u32> unmasked_generation{}; ///< Programs added to unmasked_vertex_programs
+
     const Device& device;
     Scheduler& scheduler;
     DescriptorPool& descriptor_pool;
@@ -270,6 +303,9 @@ private:
     std::optional<ScheduledPrebuild<GraphicsPipelineCacheKey, GraphicsPipeline>> scheduled_prebuild;
 
     GraphicsPipelineCacheKey graphics_key{};
+    /// Native titles: the state as the registers give it. FixedPipelineState refreshes some fields
+    /// only when they are dirty, so graphics_key.state is a canonical copy made for each draw.
+    FixedPipelineState native_state{};
     GraphicsPipeline* current_pipeline{};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
@@ -281,6 +317,7 @@ private:
     s64 native_wait_used_us{}; ///< Budget spent since the last 10 s log line.
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
+    VideoCommon::EvictedPointerSlots evicted_pointer_slots;
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with

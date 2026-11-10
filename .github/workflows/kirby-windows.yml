@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - kirby-build130-stack-fix
+      - kirby-pr1117-precompile-integration
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
