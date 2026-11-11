@@ -11,6 +11,7 @@ on:
     branches:
       - kirby-build130-stack-fix
       - kirby-pr1117-precompile-integration
+      - kirby-pr1117-runtime-diagnostics
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -433,6 +434,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
           Copy-Item -Recurse -Force tools/nx2-precompile/py (Join-Path $toolsDir 'py')
           Copy-Item -Force tools/nx2-precompile/run_pipeline.sh, tools/nx2-precompile/README.md $toolsDir
+          Copy-Item -Force tools/kirby-debug/Run-Kirby-Diagnostics.ps1 build/release/bin/Run-Kirby-Diagnostics.ps1
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
