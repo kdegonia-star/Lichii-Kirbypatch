@@ -8,13 +8,15 @@ $env:EDEN_DKB_FRAME_TRACE = "1"
 $env:EDEN_NX2_PRECOMPILED = "1"
 $session = Join-Path $root ("kirby-debug-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 New-Item -ItemType Directory -Path $session | Out-Null
+$env:EDEN_NX2_PIPELINE_BUILD_TRACE = Join-Path $session "pipeline-builds.log"
 @"
 Session: $(Get-Date -Format o)
 Build: $exe
 EDEN_DKB_FRAME_TRACE=1
 EDEN_NX2_PRECOMPILED=1
+EDEN_NX2_PIPELINE_BUILD_TRACE=$env:EDEN_NX2_PIPELINE_BUILD_TRACE
 "@ | Set-Content (Join-Path $session "session.txt")
-Write-Host "Starting Lichii with DKB frame and GPU tracing enabled."
+Write-Host "Starting Lichii with DKB frame/GPU tracing and per-pipeline driver build timings."
 Write-Host "Reproduce the shader-related FPS collapse, exit Lichii, then send eden_log.txt."
 Write-Host "Session details: $session"
 Start-Process -FilePath $exe -WorkingDirectory $root -Wait
