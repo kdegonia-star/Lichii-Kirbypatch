@@ -1,0 +1,67 @@
+name: Publish Kirby PR1117 experimental release
+
+on:
+  push:
+    branches:
+      - kirby-pr1117-precompile-integration
+    paths:
+      - '.github/workflows/publish-kirby-pr1117.yml'
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Publish verified Windows build
+    runs-on: ubuntu-24.04
+    if: github.repository == 'kdegonia-star/Lichii-Kirbypatch'
+    steps:
+      - name: Download the verified Windows artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download 42869303738 --repo "$GITHUB_REPOSITORY" \
+            --name lichii-windows-x86_64-7815784ed133ca34d733d35764dc3707d3ba5686 \
+            --dir artifact
+          test -s artifact/lichii.exe
+          test -s artifact/nx2-precompile.exe
+          test -f artifact/nx2-precompile-tools/run_pipeline.sh
+          (cd artifact && zip -q -r ../Lichii-Kirby-PR1117-precompile-Windows-x64.zip .)
+          test -s Lichii-Kirby-PR1117-precompile-Windows-x64.zip
+
+      - name: Publish experimental GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=kirby-pr1117-precompile-alpha1
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to overwrite it."
+            exit 0
+          fi
+          cat > notes.md <<'EOF'
+          Experimental Windows x64 build of Lichii for Kirby Air Riders shader/pipeline precompilation.
+
+          Based on upstream Lichii shader precompilation PR #895 and shader extraction PR #1117,
+          combined with the Kirby stack-fix work. Built and packaged successfully on GitHub Actions.
+
+          Included: `lichii.exe`, `nx2-precompile.exe`, `nx2-precompile-tools/` (Python scripts,
+          recipe pipeline script, and README), and the emulator's bundled runtime files.
+
+          **Experimental:** compile/packaging passed, but performance and stability are not
+          established across different configurations. A prepared recipe is required for the
+          new precompilation path; no game files, generated recipes, or shader caches are distributed.
+
+          Build source: `7815784ed133ca34d733d35764dc3707d3ba5686`
+          Original successful workflow: https://github.com/kdegonia-star/Lichii-Kirbypatch/actions/runs/42869303738
+          EOF
+          gh release create "$tag" Lichii-Kirby-PR1117-precompile-Windows-x64.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --target 7815784ed133ca34d733d35764dc3707d3ba5686 \
+            --prerelease \
+            --title 'Lichii Kirby Air Riders – PR #1117 shader precompilation (experimental)' \
+            --notes-file notes.md
