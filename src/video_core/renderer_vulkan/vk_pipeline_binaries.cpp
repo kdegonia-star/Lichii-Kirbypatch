@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <vector>
@@ -10,6 +11,7 @@
 #include "common/logging.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -19,6 +21,30 @@ namespace {
 namespace ShaderCacheV2 = VideoCommon::ShaderCacheV2;
 namespace StutterTrace = VideoCommon::StutterTrace;
 using ShaderCacheV2::RecordKind;
+
+thread_local std::optional<u64> traced_compute_key;
+
+class ComputeDriverCallTrace {
+public:
+    explicit ComputeDriverCallTrace(const char* path_) : path{path_} {
+        if (PipelineBuildTraceEnabled() && traced_compute_key) {
+            key = traced_compute_key;
+            begin = std::chrono::steady_clock::now();
+            TraceComputeBuildPhase("BEGIN", "compute-driver-api", *key, 0, -1.0, path);
+        }
+    }
+    ~ComputeDriverCallTrace() {
+        if (key) {
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+            TraceComputeBuildPhase("END", "compute-driver-api", *key, 0,
+                                   std::chrono::duration<double, std::milli>(elapsed).count(), path);
+        }
+    }
+private:
+    const char* path;
+    std::optional<u64> key;
+    std::chrono::steady_clock::time_point begin;
+};
 
 const VkBaseInStructure* FindNext(const void* next, VkStructureType type) {
     for (auto* item = static_cast<const VkBaseInStructure*>(next); item; item = item->pNext) {
@@ -48,6 +74,7 @@ VkResult CreateRaw(const vk::DeviceDispatch& dld, VkDevice device,
 VkResult CreateRaw(const vk::DeviceDispatch& dld, VkDevice device,
                    const VkComputePipelineCreateInfo& ci, VkPipelineCache cache,
                    VkPipeline* pipeline) {
+    const ComputeDriverCallTrace trace{"raw"};
     return dld.vkCreateComputePipelines(device, cache, 1, &ci, nullptr, pipeline);
 }
 
@@ -58,6 +85,7 @@ vk::Pipeline CreateNormally(const vk::Device& logical, const VkGraphicsPipelineC
 
 vk::Pipeline CreateNormally(const vk::Device& logical, const VkComputePipelineCreateInfo& ci,
                             VkPipelineCache cache) {
+    const ComputeDriverCallTrace trace{"normal"};
     return logical.CreateComputePipeline(ci, cache);
 }
 
@@ -223,6 +251,11 @@ vk::Pipeline PipelineBinaries::CreateGraphicsPipeline(const VkGraphicsPipelineCr
 
 vk::Pipeline PipelineBinaries::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                                      VkPipelineCache cache, u64 key) {
+    struct KeyScope {
+        std::optional<u64> previous = traced_compute_key;
+        explicit KeyScope(u64 value) { traced_compute_key = value; }
+        ~KeyScope() { traced_compute_key = previous; }
+    } scope{key};
     return Create(ci, cache, RecordKind::ComputeBinary, key);
 }
 

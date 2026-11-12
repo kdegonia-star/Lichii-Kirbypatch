@@ -46,6 +46,8 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/spirv_inline_control.h"
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/mesh_fallback_limits.h"
@@ -421,15 +423,48 @@ std::vector<u32> EmitStageSpirv(const Device& device, const Shader::Profile& pro
 }
 
 vk::ShaderModule EmitComputeModule(const Device& device, const Shader::Profile& profile,
-                                   Shader::IR::Program& program, u64 shader_hash,
+                                   Shader::IR::Program& program, u64 shader_hash, u64 pipeline_hash,
                                    std::span<const u32> reference = {}) {
-    const std::vector<u32> code{EmitComputeShader(profile, program, shader_hash, reference)};
+    const bool trace = PipelineBuildTraceEnabled();
+    const auto emit_begin = std::chrono::steady_clock::now();
+    TraceComputeBuildPhase("BEGIN", "compute-spirv", pipeline_hash, shader_hash);
+    std::vector<u32> code{EmitComputeShader(profile, program, shader_hash, reference)};
+    const double emit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - emit_begin).count();
+    static const bool shared_calls = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPUTE_SHARED_CALLS");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
+    const u64 base_hash = (trace || should_dump) ? Common::CityHash64(
+        reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32)) : 0;
+    if (shared_calls && should_dump) {
+        // Keep the pre-hint module under its content hash; the usual shader-name dump below
+        // contains exactly the module submitted to the driver.
+        GPU::Logging::DumpSpirvShader(base_hash, code);
+    }
+    const auto controls_begin = std::chrono::steady_clock::now();
+    const size_t marked = shared_calls ? VideoCommon::MarkSharedFunctionsDontInline(code) : 0;
+    const double controls_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - controls_begin).count();
+    if (trace) {
+        const u64 submitted_hash = Common::CityHash64(
+            reinterpret_cast<const char*>(code.data()), code.size() * sizeof(u32));
+        TraceComputeBuildPhase("END", "compute-spirv", pipeline_hash, shader_hash, emit_ms,
+            fmt::format("words={} base_spirv={:016x} submitted_spirv={:016x} shared_calls={} "
+                        "marked_functions={} controls_ms={:.3f}",
+                        code.size(), base_hash, submitted_hash, shared_calls, marked, controls_ms));
+    }
     device.SaveShader(code);
+    const auto module_begin = std::chrono::steady_clock::now();
+    TraceComputeBuildPhase("BEGIN", "compute-module", pipeline_hash, shader_hash);
     vk::ShaderModule spv_module{BuildShader(device, code)};
+    TraceComputeBuildPhase("END", "compute-module", pipeline_hash, shader_hash,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - module_begin).count());
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
-    const bool should_dump = Settings::values.gpu_log_shader_dumps.GetValue();
     if (should_log || should_dump) {
         const std::string shader_name = fmt::format("shader_{:016x}_compute", shader_hash);
         if (should_log) {
@@ -984,6 +1019,11 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         // The translation dropped accesses through a pointer that was null back then. Which slots
         // the game fills depends on the area, so the new one keeps binding every pointer this one
         // binds, null now or not: a null pointer binds nothing.
+        if (PipelineBuildTraceEnabled()) {
+            TraceComputeBuildPhase("REBUILD", "compute-cache", key.Hash(), key.unique_hash, -1.0,
+                fmt::format("reason=mapped_null_pointer rebuild={} kept_pointers={} native={:016x}",
+                            entry.rebuilds + 1, entry.mapped_pointers.size(), native_key));
+        }
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
         if (rebuilt.pipeline) {
             if (entry.pipeline) {
@@ -1001,10 +1041,22 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             entry.rebuilds = MaxComputeRebuilds;
         }
     }
-    if (VideoCommon::StutterTrace::Enabled() && !std::exchange(entry.used, true)) {
-        VideoCommon::StutterTrace::CountLookup(
-            is_new ? VideoCommon::StutterTrace::Lookup::ComputeNew
-                   : VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
+    if ((VideoCommon::StutterTrace::Enabled() || PipelineBuildTraceEnabled()) &&
+        !std::exchange(entry.used, true)) {
+        if (VideoCommon::StutterTrace::Enabled()) {
+            VideoCommon::StutterTrace::CountLookup(
+                is_new ? VideoCommon::StutterTrace::Lookup::ComputeNew
+                       : VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
+        }
+        if (PipelineBuildTraceEnabled()) {
+            TraceComputeBuildPhase("USE", "compute-cache", key.Hash(), key.unique_hash, -1.0,
+                fmt::format("source={} native={:016x} workgroup={}x{}x{} shared_bytes={} "
+                            "mapped_pointers={} null_slots={} rebuilds={}",
+                            is_new ? "runtime_miss" : "prebuilt", native_key,
+                            key.workgroup_size[0], key.workgroup_size[1], key.workgroup_size[2],
+                            key.shared_memory_size, entry.mapped_pointers.size(),
+                            entry.null_pointer_slots.size(), entry.rebuilds));
+        }
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
@@ -2960,14 +3012,38 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
+    const auto cfg_begin = std::chrono::steady_clock::now();
+    if (PipelineBuildTraceEnabled()) {
+        TraceComputeBuildPhase("BEGIN", "compute-cfg", hash, key.unique_hash, -1.0,
+            fmt::format("workgroup={}x{}x{} shared_bytes={} parallel={}",
+                        key.workgroup_size[0], key.workgroup_size[1], key.workgroup_size[2],
+                        key.shared_memory_size, build_in_parallel));
+    }
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+    TraceComputeBuildPhase("END", "compute-cfg", hash, key.unique_hash,
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cfg_begin).count());
 
     // Dump it before error.
     if (Settings::values.dump_guest_shaders) {
         env.Dump(hash, key.unique_hash);
     }
 
+    const auto translation_begin = std::chrono::steady_clock::now();
+    TraceComputeBuildPhase("BEGIN", "compute-translate", hash, key.unique_hash);
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    const double translation_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - translation_begin).count();
+    if (PipelineBuildTraceEnabled()) {
+        size_t instructions{};
+        for (const auto* block : program.blocks) {
+            instructions += block->Instructions().size();
+        }
+        TraceComputeBuildPhase("END", "compute-translate", hash, key.unique_hash,
+            translation_ms,
+            fmt::format("blocks={} ir_instructions={} storage_buffers={}",
+                program.blocks.size(), instructions, program.info.storage_buffers_descriptors.size()));
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
@@ -2993,10 +3069,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         job->program = std::move(program);
         // Copied by the pipeline before its job can run
         const Shader::Info& info = job->program.info;
-        auto emit = [this, job, shader_hash = key.unique_hash]() mutable {
+        auto emit = [this, job, shader_hash = key.unique_hash, pipeline_hash = hash]() mutable {
             const auto begin = std::chrono::steady_clock::now();
             vk::ShaderModule module{EmitComputeModule(device, profile, job->program, shader_hash,
-                                                      job->reference_spirv)};
+                                                      pipeline_hash, job->reference_spirv)};
             auto completed_pools = std::move(job->pools);
             job.reset();
             ReturnPools(std::move(completed_pools));
@@ -3009,7 +3085,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
             BuildQueue(build_in_parallel, ir_bytes), statistics,
             &shader_notify, info, vk::ShaderModule{}, key.unique_hash, std::move(emit));
     } else {
-        vk::ShaderModule module{EmitComputeModule(device, profile, program, key.unique_hash)};
+        vk::ShaderModule module{EmitComputeModule(device, profile, program, key.unique_hash, hash)};
         const Shader::Info info{std::move(program.info)};
         if (!build_in_parallel) {
             // The driver compiles on this thread. Precache and boot workers would otherwise hold their

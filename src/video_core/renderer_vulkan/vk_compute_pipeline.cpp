@@ -35,6 +35,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 
@@ -304,12 +305,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             const std::array<u64, 1> traced{shader_hash};
             const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
             const auto trace_begin = std::chrono::steady_clock::now();
-            TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
+            TracePipelineBuild("BEGIN", "compute", binary_key, traced, unoptimized);
             pipeline = binaries ? binaries->CreateComputePipeline(compute_ci, *pipeline_cache,
                                                                   binary_key)
                                 : device.GetLogical().CreateComputePipeline(compute_ci,
                                                                             *pipeline_cache);
-            TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
+            TracePipelineBuild("END", "compute", binary_key, traced, unoptimized,
                                std::chrono::duration<double, std::milli>(
                                    std::chrono::steady_clock::now() - trace_begin)
                                    .count());
@@ -384,6 +385,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             };
         } else {
             build_job.driver = [this] { RunBuild(); };
+        }
+        if (PipelineBuildTraceEnabled()) {
+            TraceComputeBuildPhase("SUBMIT", "compute-job", binary_key, shader_hash, -1.0,
+                fmt::format("cpu_stage={} cpu_bytes={} driver_bytes={}",
+                            static_cast<bool>(build_job.cpu), build_job.cpu_bytes,
+                            build_job.driver_bytes));
         }
         job = jobs->Submit(std::move(build_job));
     } else if (!build_queue.owner_builds) {
@@ -677,6 +684,24 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PipelineWait};
+            const bool trace_wait = PipelineBuildTraceEnabled() &&
+                                    !is_built.load(std::memory_order::relaxed);
+            const auto wait_begin = std::chrono::steady_clock::now();
+            if (trace_wait) {
+                TraceComputeBuildPhase("BEGIN", "compute-wait", binary_key, shader_hash, -1.0,
+                    fmt::format("job_status={} site=ComputePipeline::Configure",
+                                jobs ? static_cast<int>(job.Status()) : -1));
+            }
+            SCOPE_EXIT {
+                if (trace_wait) {
+                    TraceComputeBuildPhase("END", "compute-wait", binary_key, shader_hash,
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - wait_begin).count(),
+                        fmt::format("job_status={} built={}",
+                                    jobs ? static_cast<int>(job.Status()) : -1,
+                                    is_built.load(std::memory_order::relaxed)));
+                }
+            };
             if (jobs) {
                 // Raised to NeedNow, and built here unless a driver worker builds it already
                 jobs->RunOrWait(job);

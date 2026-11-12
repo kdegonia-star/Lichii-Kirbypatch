@@ -325,6 +325,8 @@ add_library(video_core STATIC
     shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
+    spirv_inline_control.cpp
+    spirv_inline_control.h
     surface.cpp
     surface.h
     texture_cache/accelerated_swizzle.cpp
