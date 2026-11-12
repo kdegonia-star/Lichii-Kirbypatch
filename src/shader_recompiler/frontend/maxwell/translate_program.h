@@ -12,13 +12,15 @@
 
 namespace Shader {
 struct HostTranslateInfo;
+struct TranslationPassTrace;
 }
 
 namespace Shader::Maxwell {
 
 [[nodiscard]] IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool,
                                            ObjectPool<IR::Block>& block_pool, Environment& env,
-                                           Flow::CFG& cfg, const HostTranslateInfo& host_info);
+                                           Flow::CFG& cfg, const HostTranslateInfo& host_info,
+                                           const TranslationPassTrace* trace = nullptr);
 
 [[nodiscard]] IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,
                                                   Environment& env_vertex_b,

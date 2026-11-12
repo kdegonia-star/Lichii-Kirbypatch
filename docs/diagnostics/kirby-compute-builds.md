@@ -136,3 +136,38 @@ GCC and address/undefined-behavior sanitizers; leak checking was disabled becaus
 LeakSanitizer cannot run under this environment's ptrace. A concurrent trace smoke test passed 800 paired events across eight threads,
 without interleaved lines. Full Vulkan and Windows runtime validation requires CI
 and the owner's A/B runs.
+
+
+## November 12 follow-up measurements
+
+The appended `compute-baseline.txt` contains multiple launches. Isolating the
+session starting at monotonic 129192.125 seconds (matching the boot marker in
+`eden_log(20261112-194725).txt`) gives 892 startup compute translations and 85
+runtime compute translations. No full compute key appears twice within this
+session, and no mapped-null-pointer rebuild is logged.
+
+Runtime shader `33acb3ded21e7a4b` takes 771.4 ms in TranslateProgram and 4.7 ms
+in the pipeline creation wrapper. Shaders `511959c65c8cb951` and
+`5154b8682a422996` take 475.3 and 435.1 ms in translation. All runtime translations
+use one thread, while startup translation is parallel. The 977 driver creation
+wrappers peak at 8.0 ms; the driver cache may already be warm. These measurements
+establish synchronous translation as a material runtime bottleneck in this run,
+without invalidating earlier cold driver compilation measurements.
+
+GPU_PROFILE was absent in the successful diagnostic run. Enabling it in a
+subsequent comparison coincided with presentation waiting for fence 3494 while
+3492 remained completed. This is correlation, not proof that the profiler causes
+the hang. Keep EDEN_NX2_GPU_PROFILE unset for the translation investigation.
+
+Per-pass translation events use the same pipeline trace file. Keep shared calls
+at zero for the baseline and use the same route/settings. The additional timing
+does not change shader passes, compilation thread counts, or command ordering.
+
+Pass events are `END compute-pass ... ms=... pass=<name>` for successful passes
+at least 1 ms, or `FAIL compute-pass` when a pass throws. Sub-millisecond success
+and begin events are omitted. Timer bodies exclude the trace sink; total translation
+time still includes trace overhead. No global/thread-local trace state is used.
+Focused production-header checks passed with address/undefined-behavior sanitizers,
+including return-value preservation, nested contexts, exception propagation,
+throwing sinks, and concurrent context isolation. Windows compilation is checked
+by the branch Actions build; game performance still requires the owner run.

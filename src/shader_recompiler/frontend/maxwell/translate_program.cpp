@@ -22,6 +22,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/translation_pass_trace.h"
 
 namespace Shader::Maxwell {
 namespace {
@@ -366,14 +367,21 @@ void TightenOutputVertices(IR::Program& program) {
 } // Anonymous namespace
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info,
+                             const TranslationPassTrace* trace) {
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
 
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
-    program.blocks = GenerateBlocks(program.syntax_list);
-    program.post_order_blocks = PostOrder(program.syntax_list.front());
+    program.syntax_list = TraceTranslationPass(trace, "BuildASL", [&] {
+        return BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    });
+    program.blocks = TraceTranslationPass(trace, "GenerateBlocks", [&] {
+        return GenerateBlocks(program.syntax_list);
+    });
+    program.post_order_blocks = TraceTranslationPass(trace, "PostOrder", [&] {
+        return PostOrder(program.syntax_list.front());
+    });
     program.stage = env.ShaderStage();
     program.local_memory_size = env.LocalMemorySize();
     switch (program.stage) {
@@ -433,41 +441,67 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     default:
         break;
     }
-    RemoveUnreachableBlocks(program);
+    TraceTranslationPass(trace, "RemoveUnreachableBlocks", [&] {
+        RemoveUnreachableBlocks(program);
+    });
 
     // Replace instructions before the SSA rewrite
     if (!normalized_host_info.support_float64) {
-        Optimization::LowerFp64ToFp32(program);
+        TraceTranslationPass(trace, "LowerFp64ToFp32", [&] {
+            Optimization::LowerFp64ToFp32(program);
+        });
     }
     if (!normalized_host_info.support_float16) {
-        Optimization::LowerFp16ToFp32(program);
+        TraceTranslationPass(trace, "LowerFp16ToFp32", [&] {
+            Optimization::LowerFp16ToFp32(program);
+        });
     }
     if (!normalized_host_info.support_int64) {
-        Optimization::LowerInt64ToInt32(program);
+        TraceTranslationPass(trace, "LowerInt64ToInt32", [&] {
+            Optimization::LowerInt64ToInt32(program);
+        });
     }
     if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
+        TraceTranslationPass(trace, "ConditionalBarrierPass", [&] {
+            Optimization::ConditionalBarrierPass(program);
+        });
     }
-    Optimization::SsaRewritePass(program);
+    TraceTranslationPass(trace, "SsaRewritePass", [&] { Optimization::SsaRewritePass(program); });
 
-    Optimization::ConstantPropagationPass(env, program);
+    TraceTranslationPass(trace, "ConstantPropagationPass", [&] {
+        Optimization::ConstantPropagationPass(env, program);
+    });
 
-    Optimization::PositionPass(env, program);
-    Optimization::BlitConstantsPass(env, program);
+    TraceTranslationPass(trace, "PositionPass", [&] { Optimization::PositionPass(env, program); });
+    TraceTranslationPass(trace, "BlitConstantsPass", [&] {
+        Optimization::BlitConstantsPass(env, program);
+    });
 
-    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
-    Optimization::GeometryCompactionPass(program, normalized_host_info);
-    Optimization::TexturePass(env, program, normalized_host_info);
+    TraceTranslationPass(trace, "GlobalMemoryToStorageBufferPass", [&] {
+        Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
+    });
+    TraceTranslationPass(trace, "GeometryCompactionPass", [&] {
+        Optimization::GeometryCompactionPass(program, normalized_host_info);
+    });
+    TraceTranslationPass(trace, "TexturePass", [&] {
+        Optimization::TexturePass(env, program, normalized_host_info);
+    });
 
     if (Settings::values.resolution_info.active) {
-        Optimization::RescalingPass(program);
+        TraceTranslationPass(trace, "RescalingPass", [&] { Optimization::RescalingPass(program); });
     }
-    Optimization::DeadCodeEliminationPass(program);
-    TightenOutputVertices(program);
+    TraceTranslationPass(trace, "DeadCodeEliminationPass", [&] {
+        Optimization::DeadCodeEliminationPass(program);
+    });
+    TraceTranslationPass(trace, "TightenOutputVertices", [&] { TightenOutputVertices(program); });
     if (Settings::values.renderer_debug) {
-        Optimization::VerificationPass(program);
+        TraceTranslationPass(trace, "VerificationPass", [&] {
+            Optimization::VerificationPass(program);
+        });
     }
-    Optimization::CollectShaderInfoPass(env, program);
+    TraceTranslationPass(trace, "CollectShaderInfoPass", [&] {
+        Optimization::CollectShaderInfoPass(env, program);
+    });
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
@@ -480,12 +514,22 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
             program.info.stores.Set(static_cast<IR::Attribute>(line), true);
         }
     }
-    Optimization::LayerPass(program, normalized_host_info);
-    Optimization::VendorWorkaroundPass(program);
+    TraceTranslationPass(trace, "LayerPass", [&] {
+        Optimization::LayerPass(program, normalized_host_info);
+    });
+    TraceTranslationPass(trace, "VendorWorkaroundPass", [&] {
+        Optimization::VendorWorkaroundPass(program);
+    });
 
-    CollectInterpolationInfo(env, program);
-    AddNVNStorageBuffers(program, normalized_host_info);
-    Optimization::LimitSampledTextureArrays(program, normalized_host_info);
+    TraceTranslationPass(trace, "CollectInterpolationInfo", [&] {
+        CollectInterpolationInfo(env, program);
+    });
+    TraceTranslationPass(trace, "AddNVNStorageBuffers", [&] {
+        AddNVNStorageBuffers(program, normalized_host_info);
+    });
+    TraceTranslationPass(trace, "LimitSampledTextureArrays", [&] {
+        Optimization::LimitSampledTextureArrays(program, normalized_host_info);
+    });
     return program;
 }
 

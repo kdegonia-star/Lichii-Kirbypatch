@@ -39,6 +39,7 @@
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
 #include "shader_recompiler/program_header.h"
+#include "shader_recompiler/translation_pass_trace.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -3031,7 +3032,30 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 
     const auto translation_begin = std::chrono::steady_clock::now();
     TraceComputeBuildPhase("BEGIN", "compute-translate", hash, key.unique_hash);
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    struct PassTraceContext {
+        u64 pipeline_hash;
+        u64 shader_hash;
+    } pass_context{hash, key.unique_hash};
+    const Shader::TranslationPassTrace pass_trace{
+        .callback = [](void* opaque, const char* pass, Shader::TranslationPassEvent event,
+                       std::chrono::nanoseconds elapsed) {
+            // Keep the trace light: no begin records, and successful sub-millisecond passes
+            // are omitted. Failed passes are always reported.
+            if (event == Shader::TranslationPassEvent::Begin ||
+                (event == Shader::TranslationPassEvent::End &&
+                 elapsed < std::chrono::milliseconds{1})) {
+                return;
+            }
+            const auto& context = *static_cast<const PassTraceContext*>(opaque);
+            TraceComputeBuildPhase(event == Shader::TranslationPassEvent::End ? "END" : "FAIL",
+                "compute-pass", context.pipeline_hash, context.shader_hash,
+                std::chrono::duration<double, std::milli>(elapsed).count(),
+                fmt::format("pass={}", pass));
+        },
+        .context = &pass_context,
+    };
+    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info,
+                                  PipelineBuildTraceEnabled() ? &pass_trace : nullptr)};
     const double translation_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - translation_begin).count();
     if (PipelineBuildTraceEnabled()) {
