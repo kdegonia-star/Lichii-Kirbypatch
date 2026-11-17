@@ -26,6 +26,7 @@
 
 #include <fmt/format.h>
 
+#include "video_core/nx2_stall_trace.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -2553,12 +2554,20 @@ void RasterizerVulkan::DispatchCompute() {
     const bool marking_effects = oot_effects_frame == render_trace_frame &&
                                  OcarinaTemporalEnabled() && !indirect_address && !list_slot &&
                                  !frame_dump.Capturing();
+    VideoCommon::Nx2StallTrace::BeginDispatch();
     ComputePipeline::BindCommand deferred_bind;
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache, texture_cache_runtime, byte_addressed_shadow,
                              can_replace || marking_effects ? &deferred_bind : nullptr)) {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
+    }
+    {
+        const auto& launch = kepler_compute->launch_description;
+        VideoCommon::Nx2StallTrace::NoteDispatch(scheduler.CurrentTick(), pipeline->ShaderHash(),
+                                                 native_key,
+                                                 {launch.grid_dim_x, launch.grid_dim_y,
+                                                  launch.grid_dim_z});
     }
     SCOPE_EXIT {
         if (!frame_dump.Capturing()) {
