@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/compute_write_grid.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
+#include "video_core/nx2_stall_trace.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -2969,6 +2970,9 @@ void BufferCache<P>::BindHostComputeStorageBuffers() {
         const Binding& binding = channel_state->compute_storage_buffers[index];
         const bool is_written =
             ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
+        VideoCommon::Nx2StallTrace::NoteStorage(index, binding.gpu_addr, binding.device_addr,
+                                                binding.size, is_written,
+                                                binding.segment_count >= 2);
         // A native program's binding is min(layout, 8 MiB) because its pointer has no size, and
         // marking all of it GPU-written defers the CPU's later writes to those pages. Mark only
         // what BindComputeStorageBuffer worked out the dispatch can write; the binding keeps its
