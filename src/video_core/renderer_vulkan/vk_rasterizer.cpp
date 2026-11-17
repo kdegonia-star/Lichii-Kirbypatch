@@ -1542,6 +1542,22 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 } // Anonymous namespace
 
 bool RasterizerVulkan::ValidateDrawMemory(bool is_indexed, bool is_indirect) {
+    // EDEN_NX2_DRAW_GUARD=0: draw without these checks (A/B against the guard).
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_GUARD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled) {
+        return true;
+    }
+    const auto reject_index = [](const char* why, GPUVAddr address, u64 bytes, GPUVAddr limit) {
+        static std::atomic<u32> warnings{};
+        if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(HW_GPU, "Draw skipped: index buffer {} at {:#x}, bytes={:#x}, limit={:#x}",
+                        why, address, bytes, limit);
+        }
+        return false;
+    };
     const auto reject = [](const char* kind, GPUVAddr address, u64 bytes) {
         static std::atomic<u32> warnings{};
         if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -1583,11 +1599,14 @@ bool RasterizerVulkan::ValidateDrawMemory(bool is_indexed, bool is_indirect) {
             bytes = std::min(bytes, index.EndAddress() - start + 1);
         }
         if (index.count != 0) {
-            if (index.EndAddress() < start || bytes > index.EndAddress() - start + 1) {
-                return reject("index", start, bytes);
+            // A limit below the start is no limit: the buffer cache and EstimateIndexBufferSize
+            // treat it so, and Switch 2 programs draw valid indices with one.
+            const GPUVAddr limit = index.EndAddress();
+            if (limit >= start && bytes > limit - start + 1) {
+                return reject_index("past its limit", start, bytes, limit);
             }
-            if (!mapped("index", start, bytes)) {
-                return false;
+            if (!gpu_memory->IsFullyMappedRange(start, bytes)) {
+                return reject_index("not mapped", start, bytes, limit);
             }
         }
     }
