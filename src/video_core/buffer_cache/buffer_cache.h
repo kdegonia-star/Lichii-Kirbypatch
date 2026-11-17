@@ -4382,6 +4382,16 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                                             packed_size != 0 && packed_size <= memory_layout_size;
             const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
             const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
+            // EDEN_NX2_POINTER_BINDING_CAP=1: bind every table and native pointer at most 8 MiB,
+            // skipping the size word and the reach to the end of the mapping (an A/B for Kirby Air
+            // Riders' compute MMU fault reading past a pointer binding).
+            static const bool cap_pointer_bindings = [] {
+                const char* value = std::getenv("EDEN_NX2_POINTER_BINDING_CAP");
+                return value != nullptr && value[0] == '1';
+            }();
+            if (cap_pointer_bindings && (table_pointer || native_pointer)) {
+                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+            }
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
