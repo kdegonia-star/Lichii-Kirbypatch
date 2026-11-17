@@ -9,7 +9,7 @@
 #include <mutex>
 
 #include "common/common_types.h"
-#include "common/logging/log.h"
+#include "common/logging.h"
 
 // EDEN_NX2_GPU_STALL_TRACE=1: keeps the last compute dispatches with their storage bindings, and
 // when a wait for the GPU passes 5 s, logs the ones the GPU has not finished.
