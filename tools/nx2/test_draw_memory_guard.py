@@ -17,6 +17,7 @@ prefix=r'''
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 #include <cassert>
@@ -39,7 +40,12 @@ int main(){
  assert(r.ValidateDrawMemory(true,false));
  i.count=0xffffffff; assert(!r.ValidateDrawMemory(true,false)); i.count=3;
  i.first=0xffffffff; assert(!r.ValidateDrawMemory(true,false)); i.first=0;
- i.end=i.start-1; assert(!r.ValidateDrawMemory(true,false)); i.end=0x2000;
+ // A limit below the start is no limit (Switch 2 draws valid indices with one).
+ i.end=i.start-1; assert(r.ValidateDrawMemory(true,false)); i.end=0x2000;
+ // A one-triangle u16 draw whose limit is its last byte (Kirby Air Riders).
+ i.format=Maxwell::IndexFormat::UnsignedShort; i.end=i.start+5; assert(r.ValidateDrawMemory(true,false));
+ i.end=i.start+4; assert(!r.ValidateDrawMemory(true,false));
+ i.format=Maxwell::IndexFormat::UnsignedInt; i.end=0x2000;
  i.start=0x9000; i.end=0xa000; assert(!r.ValidateDrawMemory(true,false));
  e.draw_manager.draw_state.inline_index_draw_indexes={0,1,2}; assert(r.ValidateDrawMemory(true,false));
  e.draw_manager.draw_state.inline_index_draw_indexes.clear(); i.start=0x1000; i.end=0x5000; i.count=3072; m.hole=0x2000;
