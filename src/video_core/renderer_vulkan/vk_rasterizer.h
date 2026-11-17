@@ -207,6 +207,8 @@ private:
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
 
+    bool ValidateDrawMemory(bool is_indexed, bool is_indirect);
+
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);

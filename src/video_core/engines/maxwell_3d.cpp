@@ -26,6 +26,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_macro_transaction.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_async_readback.h"
 #include "video_core/nx2_cmdpage_diag.h"
@@ -1389,6 +1390,11 @@ struct Maxwell3D::FrontState {
     struct BackMacro {
         u32 start{};
         bool back{};                           ///< Runs on the back (else on the front)
+        bool transactional{};
+        bool data_ram{};
+        bool interpreter_fallback{};
+        bool normal_fallback_logged{};
+        u64 failures{};
         std::vector<u32> writes;               ///< The registers its code can write
         std::bitset<Regs::NUM_REGS> write_set; ///< The same, for the back's check
         std::atomic<bool> escaped{};           ///< The back saw it write another register
@@ -1397,6 +1403,7 @@ struct Maxwell3D::FrontState {
     std::vector<std::unique_ptr<BackMacro>> back_macros;
     u64 back_generation{~u64{0}};
     std::vector<u32> back_demoted; ///< Starts of macros that wrote outside their write set
+    NativeMacroTransaction transaction;
     /// The back's macro engine, its code a copy of the front's (when back_code_copied).
     std::unique_ptr<MacroEngine> back_engine;
     bool back_code_copied{};
@@ -1406,6 +1413,21 @@ struct Maxwell3D::FrontState {
 };
 
 namespace {
+
+bool CanStageMacroWrite(u32 method) {
+    switch (method) {
+    case 0x157: // MME_DMA_READ
+    case 0x158: // MME_DMA_READ_FIFOED
+    case MAXWELL3D_REG_INDEX(shadow_ram_control):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction_ptr):
+    case MAXWELL3D_REG_INDEX(load_mme.instruction):
+    case MAXWELL3D_REG_INDEX(load_mme.start_address):
+    case MAXWELL3D_REG_INDEX(falcon[4]):
+        return false;
+    default:
+        return method < MacroRegistersStart;
+    }
+}
 
 // EDEN_NX2_SPLIT_VERIFY=1: every 4096 front macro calls, wait for the back and compare the
 // front's registers with the back's (logs and resynchronizes differences).
@@ -1916,7 +1938,45 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                                    method, engine.native_code, engine.native_code_generation, start,
                                    fs.parameters, native_data_ram, fs.regs)
             : nullptr;
-    const bool on_back = FrontRunOnBack(system, split, fs, engine, start);
+    bool on_back = FrontRunOnBack(system, split, fs, engine, start);
+    FrontState::BackMacro* const classification =
+        start < fs.back_macros.size() ? fs.back_macros[start].get() : nullptr;
+    if (!on_back && (!classification || !classification->transactional)) {
+        // External reads, firmware and code uploads cannot be replayed after a partial attempt.
+        // Run those once on the normal engine at their ordered position, with no front JIT attempt.
+        if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
+            channel != nullptr && !channel->words.empty()) {
+            ConcretizeListWords(split, rasterizer, *channel, native_data_ram, engine, start);
+        }
+        if (!classification || !std::exchange(classification->normal_fallback_logged, true)) {
+            LOG_WARNING(HW_GPU,
+                        "Native MME start={:#x} excluded from split-front execution: "
+                        "effects cannot be staged; using ordered interpreter without retry",
+                        start);
+        }
+        split.Run([&] {
+            ConsumeSink(system);
+            const bool was_front = std::exchange(front_macros, false);
+            const bool was_forced = std::exchange(engine.force_native_interpreter, true);
+            SCOPE_EXIT {
+                front_macros = was_front;
+                engine.force_native_interpreter = was_forced;
+            };
+            engine.Execute(system, *this, start, fs.parameters);
+            draw_manager.DrawDeferred(*this);
+            ConsumeSink(system);
+            std::memcpy(fs.regs.data(), regs.reg_array.data(), sizeof(fs.regs));
+            std::memcpy(fs.shadow.data(), shadow_state.reg_array.data(), sizeof(fs.shadow));
+            fs.control = shadow_state.shadow_ram_control;
+            fs.back_regs.fill(0);
+            fs.back_shadow.fill(0);
+            fs.back_owned.reset();
+            fs.instance_loop = draw_manager.draw_state.draw_mode == DrawManager::DrawMode::Instance;
+            fs.draw_pending = false;
+            fs.sink_pending = false;
+        }, VideoCommon::DrainSite::MacroDmaRead);
+        on_back = true;
+    }
     if (!on_back) {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
@@ -1929,7 +1989,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             const u32 value = address >= Regs::NUM_REGS ? 0U
                               : fs.back_owned[address] ? FrontRegister(split, fs, address)
                                                        : fs.regs[address];
-            ListTrace::NoteRead(trace, address, value);
             return value;
         };
         const auto emit = [&](u32 address, u32 value) {
@@ -1938,31 +1997,103 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             }
             ListTrace::NoteWrite(trace, address, value);
             FrontWrite(split, fs, address, value, true, true);
-            // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
-            if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, method, address, value);
-            }
             return true;
         };
+        FrontState::BackMacro* const known = classification;
+        ASSERT(known && known->transactional);
+        auto& transaction = fs.transaction;
+        const auto staged_read = [&](u32 address) {
+            const u32 value = address < Regs::NUM_REGS
+                                  ? transaction.ReadRegister(address, read) : 0U;
+            ListTrace::NoteRead(trace, address, value);
+            return value;
+        };
+        const auto staged_emit = [&](u32 address, u32 value) {
+            // Check even after static analysis: a miscompiled JIT must not publish an external
+            // operation or a code upload before the interpreter can retry the call.
+            if (!CanStageMacroWrite(address)) {
+                return false;
+            }
+            u32 effective = value;
+            if (fs.control == Regs::ShadowRamControl::Replay) {
+                if (fs.back_shadow[address] != 0) {
+                    WaitForBackMacros(split, fs.back_shadow[address],
+                                      VideoCommon::DrainSite::BackRegister);
+                    effective = shadow_state.reg_array[address];
+                } else {
+                    effective = fs.shadow[address];
+                }
+            }
+            transaction.SetRegister(address, effective);
+            constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+            if (address >= cb_data && address < cb_data + 16) {
+                constexpr u32 offset = MAXWELL3D_REG_INDEX(const_buffer.offset);
+                transaction.SetRegister(offset, transaction.ReadRegister(offset, read) + u32{sizeof(u32)});
+            }
+            return transaction.Emit(address, value);
+        };
+        const auto run = [&]([[maybe_unused]] bool interpreter) {
+            const size_t trace_reads = trace ? trace->reads.size() : 0;
+            const size_t trace_writes = trace ? trace->writes.size() : 0;
+            const auto result = transaction.Run(known->data_ram ? &native_data_ram : nullptr, [&] {
+                engine.native_interpreter.active_dram = &transaction.Ram();
 #ifdef ARCHITECTURE_x86_64
-        if (!engine.native_jit) {
-            engine.native_jit = std::make_shared<TuringMacroJit>();
-        }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result =
-            trace != nullptr && trace->data_ram
-                ? engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read,
-                                                    emit)
-                : engine.native_jit->Execute(start, fs.parameters,
-                                             std::span<u32>{native_data_ram}, read, emit);
-#else
-        const auto result =
-            engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
+                if (!interpreter) {
+                    if (!engine.native_jit) {
+                        engine.native_jit = std::make_shared<TuringMacroJit>();
+                    }
+                    engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+                    return engine.native_jit->Execute(start, fs.parameters,
+                        std::span<u32>{transaction.Ram()}, staged_read, staged_emit);
+                }
 #endif
+                return engine.native_interpreter.Execute(engine.native_code, start,
+                                                         fs.parameters, staged_read, staged_emit);
+            // At most two emits per interpreter instruction. Bound the JIT's staging before
+            // allocation; its branch budget can otherwise permit far more writes than a retry.
+            }, emit, size_t{engine.native_interpreter.step_limit} * 2);
+            if (!result.success && trace) {
+                trace->reads.resize(trace_reads);
+                trace->writes.resize(trace_writes);
+            }
+            return result;
+        };
+        SCOPE_EXIT { engine.native_interpreter.active_dram = &native_data_ram; };
+        static const bool use_jit = [] {
+            const char* value = std::getenv("EDEN_NX2_MME_JIT");
+            return value == nullptr || value[0] != '0';
+        }();
+        bool interpreted = !use_jit || (trace != nullptr && trace->data_ram) ||
+                           known->interpreter_fallback;
+#ifndef ARCHITECTURE_x86_64
+        interpreted = true;
+#endif
+        auto result = run(interpreted);
+        if (!result.success && !interpreted) {
+            const size_t discarded = transaction.WriteCount();
+            known->interpreter_fallback = true;
+            const auto jit_error = result.error;
+            const auto jit_pc = result.pc;
+            result = run(true);
+            LOG_WARNING(HW_GPU,
+                        "Native MME front retry: start={:#x} jit_pc={:#x} jit_error={} "
+                        "discarded_writes={} interpreter_success={}",
+                        start, jit_pc, jit_error, discarded, result.success);
+        }
         if (!result.success) {
             engine.native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
-                      start, result.consumed, parameter_count, result.error);
+            engine.native_interpreter.data_ram_reads.clear();
+            engine.native_interpreter.data_ram_writes.clear();
+            const u64 failures = ++known->failures;
+            if (failures == 1 || (failures & 1023) == 0) {
+                LOG_ERROR(HW_GPU,
+                          "Native MME (split front) failed: start={:#x} pc={:#x} "
+                          "parameters_consumed={}/{} instruction_budget={} error={} "
+                          "writes_discarded={} transactional=true failures={}",
+                          start, result.pc, result.consumed, parameter_count,
+                          engine.native_interpreter.step_limit, result.error,
+                          transaction.WriteCount(), failures);
+            }
         }
     }
     if (trace != nullptr) {
@@ -1990,9 +2121,6 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
                                const MacroEngine& engine, u32 start) {
     using DrainSite = VideoCommon::DrainSite;
     using BackMacro = FrontState::BackMacro;
-    if (fs.parameters.size() > 0x1000) {
-        return false;
-    }
     // A macro the back ran wrote another register: the front's copies may be stale anywhere. It
     // runs on the front from now on, and the front takes the back's registers (FrontVerify).
     const auto take_escapes = [&] {
@@ -2031,6 +2159,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         known->start = start;
         const auto effects = TuringMacroInterpreter::AnalyzeEffects(engine.native_code, start);
         const auto& methods = effects.methods;
+        known->transactional = effects.methods_known &&
+                               std::ranges::all_of(methods, CanStageMacroWrite);
+        known->data_ram = effects.data_ram;
         const bool fifo_read = std::ranges::binary_search(methods, 0x158U);
         if (fifo_read || std::ranges::binary_search(methods, 0x157U)) {
             std::string reason;
@@ -2062,7 +2193,7 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
             }
         }
     }
-    if (!known->back) {
+    if (!known->back || fs.parameters.size() > 0x1000) {
         return false;
     }
     if (!fs.back_engine) {

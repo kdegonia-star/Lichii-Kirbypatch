@@ -1541,6 +1541,84 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+bool RasterizerVulkan::ValidateDrawMemory(bool is_indexed, bool is_indirect) {
+    const auto reject = [](const char* kind, GPUVAddr address, u64 bytes) {
+        static std::atomic<u32> warnings{};
+        if (warnings.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(HW_GPU, "Draw skipped: invalid {} buffer range at {:#x}, bytes={:#x}",
+                        kind, address, bytes);
+        }
+        return false;
+    };
+    const auto mapped = [&](const char* kind, GPUVAddr address, u64 bytes) {
+        return (bytes != 0 && gpu_memory->IsFullyMappedRange(address, bytes)) ||
+               reject(kind, address, bytes);
+    };
+    const auto& state = maxwell3d->draw_manager.draw_state;
+    if (is_indexed && state.inline_index_draw_indexes.empty()) {
+        const auto& index = state.index_buffer;
+        const u64 start = index.StartAddress();
+        u64 element_size{};
+        switch (index.format) {
+        case Maxwell::IndexFormat::UnsignedByte:
+            element_size = 1;
+            break;
+        case Maxwell::IndexFormat::UnsignedShort:
+            element_size = 2;
+            break;
+        case Maxwell::IndexFormat::UnsignedInt:
+            element_size = 4;
+            break;
+        default:
+            return reject("index format", start, 0);
+        }
+        // The cache uploads the prefix as well as the requested indices. Calculate in 64 bits
+        // before its 32-bit size arithmetic, and validate every page that upload can read.
+        u64 bytes = (u64{index.first} + index.count) * element_size;
+        if (bytes > std::numeric_limits<u32>::max()) {
+            return reject("index overflow", start, bytes);
+        }
+        if (is_indirect && index.EndAddress() >= start) {
+            // Indirect draws use a conservative count estimate; the cache clamps the binding.
+            bytes = std::min(bytes, index.EndAddress() - start);
+        }
+        if (index.count != 0) {
+            if (index.EndAddress() < start || bytes > index.EndAddress() - start) {
+                return reject("index", start, bytes);
+            }
+            if (!mapped("index", start, bytes)) {
+                return false;
+            }
+        }
+    }
+    if (is_indirect) {
+        const auto& params = maxwell3d->draw_manager.indirect_state;
+        const u64 record_size = params.is_byte_count ? sizeof(u32)
+                               : params.is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                                   : sizeof(VkDrawIndirectCommand);
+        const u64 count = params.is_byte_count ? 1 : params.max_draw_counts;
+        if (count == 0) {
+            return false;
+        }
+        if (count > std::numeric_limits<u32>::max() ||
+            params.stride > std::numeric_limits<u32>::max() ||
+            (count > 1 && (params.stride < record_size || params.stride % 4 != 0))) {
+            return reject("indirect layout", params.indirect_start_address, params.buffer_size);
+        }
+        const u64 required = (count - 1) * params.stride + record_size;
+        if (required > params.buffer_size) {
+            return reject("indirect", params.indirect_start_address, required);
+        }
+        if (!mapped("indirect", params.indirect_start_address, params.buffer_size)) {
+            return false;
+        }
+        if (params.include_count && !mapped("indirect count", params.count_start_address, sizeof(u32))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
@@ -1560,6 +1638,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             return;
         }
+    }
+    if (!ValidateDrawMemory(is_indexed, false)) {
+        return;
     }
     if (TryNx2IndirectReset(is_indexed, instance_count)) {
         return;
@@ -1784,6 +1865,9 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
+    }
+    if (!ValidateDrawMemory(params.is_indexed, true)) {
+        return;
     }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {

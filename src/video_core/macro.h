@@ -254,6 +254,8 @@ struct MacroEngine {
     bool is_interpreted;
     bool native_turing{};
     bool native_execution_failed{};
+    /// Ordered fallback for a split-front macro with effects that cannot be staged.
+    bool force_native_interpreter{};
     u32 native_write_offset{};
     std::array<u32, 0x8000> native_code{};
     TuringMacroInterpreter native_interpreter;

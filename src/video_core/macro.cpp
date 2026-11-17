@@ -1507,7 +1507,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             const char* value = std::getenv("EDEN_NX2_MME_JIT");
             return value == nullptr || value[0] != '0';
         }();
-        if (use_jit) {
+        if (use_jit && !force_native_interpreter) {
             if (!native_jit) {
                 native_jit = std::make_shared<TuringMacroJit>();
             }
@@ -1528,10 +1528,11 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
 #endif
         // EDEN_NX2_MME_MEMO=0: interpret every call (see macro_memo.h).
-        static const bool use_memo = [] {
+        static const bool allow_memo = [] {
             const char* value = std::getenv("EDEN_NX2_MME_MEMO");
             return value == nullptr || value[0] != '0';
         }();
+        const bool use_memo = allow_memo && !force_native_interpreter;
         if (use_memo) {
             // EDEN_NX2_MME_MEMO_STATS: log the memo's counters every 2^24 calls.
             if (static const bool memo_stats = std::getenv("EDEN_NX2_MME_MEMO_STATS") != nullptr;

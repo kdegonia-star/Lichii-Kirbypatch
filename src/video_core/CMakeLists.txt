@@ -102,6 +102,7 @@ add_library(video_core STATIC
     macro.h
     macro_memo.h
     macro_turing.h
+    native_macro_transaction.h
     fence_manager.h
     frame_gen_choice.h
     front_qmd.h
