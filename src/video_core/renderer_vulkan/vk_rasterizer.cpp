@@ -1580,10 +1580,10 @@ bool RasterizerVulkan::ValidateDrawMemory(bool is_indexed, bool is_indirect) {
         }
         if (is_indirect && index.EndAddress() >= start) {
             // Indirect draws use a conservative count estimate; the cache clamps the binding.
-            bytes = std::min(bytes, index.EndAddress() - start);
+            bytes = std::min(bytes, index.EndAddress() - start + 1);
         }
         if (index.count != 0) {
-            if (index.EndAddress() < start || bytes > index.EndAddress() - start) {
+            if (index.EndAddress() < start || bytes > index.EndAddress() - start + 1) {
                 return reject("index", start, bytes);
             }
             if (!mapped("index", start, bytes)) {
