@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 
@@ -18,6 +19,11 @@ MultiRangeBufferCache::MultiRangeBufferCache(const Device& device) {
         sparse_usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     if (!device.IsSparseBindingSupported()) {
+        return;
+    }
+    // EDEN_NX2_MULTI_RANGE_SPARSE=0: no sparse buffers aliasing other buffers' memory; read bindings
+    // over several ranges are gathered into a copy (an A/B for Kirby Air Riders' compute MMU faults).
+    if (const char* value = std::getenv("EDEN_NX2_MULTI_RANGE_SPARSE"); value && value[0] == '0') {
         return;
     }
     u32 memory_type_bits = 0;
