@@ -9,6 +9,7 @@
 #include "common/settings.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_stall_trace.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -119,7 +120,20 @@ void MasterSemaphore::Wait(u64 tick) {
     // If none of the above is hit, fallback to a regular wait
     const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
     try {
-        while (!semaphore.Wait(tick)) {
+        if (VideoCommon::Nx2StallTrace::Enabled()) {
+            u64 waited_ms = 0;
+            bool reported = false;
+            while (!semaphore.Wait(tick, 1'000'000'000)) {
+                waited_ms += 1000;
+                if (!reported && waited_ms >= 5000) {
+                    reported = true;
+                    VideoCommon::Nx2StallTrace::ReportStall(tick, semaphore.GetCounter(),
+                                                            waited_ms);
+                }
+            }
+        } else {
+            while (!semaphore.Wait(tick)) {
+            }
         }
     } catch (const vk::Exception& exception) {
         if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
